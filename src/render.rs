@@ -6,8 +6,28 @@ use image::{Rgb, RgbImage};
 use rayon::prelude::*;
 use std::io::Write;
 
-/// Elevation (m) of a parcel from its recorded history.
-pub fn parcel_elev(w: &World, pc: &Parcel) -> f64 {
+/// Elevation (m) of a parcel relative to current sea level.
+pub fn parcel_elev(w: &World, pc: &Parcel) -> f64 { parcel_elev_abs(w, pc) - w.sea_level }
+
+/// Eustatic sea level: the ocean's volume is fixed at its t = 0 value, so sea level rises when ridges
+/// are young and voluminous and falls after collisions and ridge subduction (Scotese's last rule).
+pub fn update_sea_level(w: &mut World) {
+    let es: Vec<f64> = w.parcels.iter().filter(|pc| pc.alive).map(|pc| parcel_elev_abs(w, pc)).collect();
+    if es.is_empty() { return; }
+    let vol = |z: f64| es.iter().map(|&e| if e < z { z - e } else { 0.0 }).sum::<f64>() / es.len() as f64;
+    // Datum: the ocean volume after 100 Myr of spin-up (the random initial sea floor is older and
+    // deeper than the steady state the engine settles into).
+    let v0 = match w.sea_v0 {
+        Some(v) => v,
+        None => { if w.t >= 100.0 - 1e-6 { w.sea_v0 = Some(vol(0.0)); } w.sea_level = 0.0; return; }
+    };
+    let (mut lo, mut hi) = (-4000.0, 4000.0);
+    for _ in 0..50 { let mid = 0.5 * (lo + hi); if vol(mid) < v0 { lo = mid; } else { hi = mid; } }
+    w.sea_level = 0.5 * (lo + hi);
+}
+
+/// Elevation (m) of a parcel from its recorded history, in the fixed datum (sea level at t = 0).
+pub fn parcel_elev_abs(w: &World, pc: &Parcel) -> f64 {
     let t = w.t;
     let mut e = match pc.kind {
         Kind::Oceanic => {
@@ -16,7 +36,7 @@ pub fn parcel_elev(w: &World, pc: &Parcel) -> f64 {
             let depth = (2600.0 + 350.0 * age.sqrt()).min(5700.0);
             let mut e = -depth;
             let dtr = t - pc.trench_t;
-            if dtr < 10.0 { e -= 3000.0 * (1.0 - dtr / 10.0); }
+            if dtr < 10.0 { e -= 3500.0 * pc.trench_w * (1.0 - dtr / 10.0); }
             e
         }
         // Airy isostasy: ~180 m of elevation per km of crust above the ~32.8 km sea-level reference.
@@ -24,7 +44,7 @@ pub fn parcel_elev(w: &World, pc: &Parcel) -> f64 {
     };
     e += pc.volc * 1000.0;
     let dh = t - pc.hot_t;
-    if dh < 40.0 { e += 1000.0 * (-dh / 15.0).exp(); }
+    if dh < 40.0 { e += 600.0 * (-dh / 15.0).exp(); }
     e
 }
 
@@ -36,6 +56,7 @@ struct Px { elev: f32, plate: u32, kind: u8, age: f32, cls: u8 }
 pub fn classify(w: &World, i: usize) -> u8 {
     let pc = &w.parcels[i];
     let t = w.t;
+    if t - pc.rift_t < 1.5 * w.p.dt { return 5; }
     if let Some(Some(b)) = w.binfo.get(i) {
         if b.dist < 1.5 * w.s && b.other != pc.plate {
             let pj = &w.parcels[b.oidx as usize];
@@ -232,8 +253,8 @@ pub fn render(w: &World) {
 
     let mut meta = std::fs::File::create(format!("{}/meta.json", dir)).expect("meta");
     let land = rows.iter().flatten().filter(|p| p.elev > 0.0).count() as f64 / (wd * ht) as f64;
-    writeln!(meta, "{{ \"t_myr\": {}, \"width\": {}, \"height\": {}, \"plates\": {}, \"parcels\": {}, \"land_frac_pixels\": {:.4}, \"elev_raw\": \"elev_{}x{}_f32le.raw\", \"projection\": \"equirectangular, lon -180..180 left->right, lat 90..-90 top->bottom\", \"boundary_pixels\": {{ \"trench\": {}, \"arc\": {}, \"collision\": {}, \"ridge\": {}, \"rift\": {}, \"transform\": {}, \"suture_recent\": {}, \"hotspot_active\": {} }} }}",
-        w.t, wd, ht, w.alive_plates(), w.stats.n_parcels, land, wd, ht, counts[1], counts[2], counts[3], counts[4], counts[5], counts[6], counts[7], counts[8]).unwrap();
+    writeln!(meta, "{{ \"t_myr\": {}, \"width\": {}, \"height\": {}, \"plates\": {}, \"parcels\": {}, \"land_frac_pixels\": {:.4}, \"sea_level_m\": {:.1}, \"elev_raw\": \"elev_{}x{}_f32le.raw\", \"projection\": \"equirectangular, lon -180..180 left->right, lat 90..-90 top->bottom\", \"boundary_pixels\": {{ \"trench\": {}, \"arc\": {}, \"collision\": {}, \"ridge\": {}, \"rift\": {}, \"transform\": {}, \"suture_recent\": {}, \"hotspot_active\": {} }} }}",
+        w.t, wd, ht, w.alive_plates(), w.stats.n_parcels, land, w.sea_level, wd, ht, counts[1], counts[2], counts[3], counts[4], counts[5], counts[6], counts[7], counts[8]).unwrap();
 }
 
 fn lerp(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {

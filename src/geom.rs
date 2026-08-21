@@ -174,3 +174,8 @@ pub fn mat_to_axis_angle(m: M3) -> (V3, f64) {
     }
     (scale(axis, 1.0 / n), th)
 }
+
+/// Point at angular distance `step` from unit vector `p` along unit tangent `d`.
+pub fn move_along(p: V3, d: V3, step: f64) -> V3 {
+    normalize(add(scale(p, step.cos()), scale(d, step.sin())))
+}

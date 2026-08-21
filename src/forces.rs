@@ -10,6 +10,7 @@ pub fn update_omegas(w: &mut World) {
     let mut torque = vec![[0.0f64; 3]; np];
     let mut drag = vec![[[0.0f64; 3]; 3]; np];
     let mut slab = vec![0.0f64; np];
+    let mut suction = vec![0.0f64; np];
     let area = s * s; // each parcel represents ~s^2 steradians
     let len = s;      // each boundary parcel represents ~s radians of boundary
 
@@ -52,7 +53,12 @@ pub fn update_omegas(w: &mut World) {
                     let g = (age / 80.0).clamp(0.2, 1.0);
                     let m = p.k_suction * len * g;
                     f = add(f, scale(b.n, m));
+                    suction[a] += m;
                 }
+            } else {
+                // Convergence at a contact that has not started subducting is resisted: compression
+                // builds there until initiation (Rule IV: subduction is hard to start).
+                f = add(f, scale(b.n, -p.k_resist * len));
             }
         } else if b.conv < -CONV_EPS {
             // Ridge push: away from the ridge, into the plate. Secondary to slab pull (Rule II: ~20%).
@@ -85,6 +91,7 @@ pub fn update_omegas(w: &mut World) {
         let pl = &mut w.plates[a];
         pl.omega = add(scale(pl.omega, 1.0 - k), scale(om, k));
         pl.slab = slab[a];
+        pl.suction = suction[a];
     }
 }
 

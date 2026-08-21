@@ -41,7 +41,8 @@ pub fn step(w: &mut World) {
 }
 
 fn detect(w: &World) -> Vec<Option<BInfo>> {
-    let r = 1.5 * w.s;
+    // Wide enough to see a passive margin (200 km); force and consumption rules apply their own radii.
+    let r = w.reach(1.5, 200.0);
     (0..w.parcels.len())
         .into_par_iter()
         .map(|i| {
@@ -72,6 +73,10 @@ fn interact(w: &mut World) {
     let dt = w.p.dt;
     let r_col = 0.8 * s;
     let r_deep = 0.45 * s;
+    let r_contact = 1.5 * s;
+    let r_arc = w.reach(1.5, 170.0);
+    let r_fl = w.reach(2.5, 280.0);
+    let r_virus = w.km(w.p.virus_km);
     let mut kills: Vec<usize> = vec![];
     let mut arcs: Vec<usize> = vec![];
     let mut thick_add: Vec<(usize, f64)> = vec![];
@@ -79,25 +84,45 @@ fn interact(w: &mut World) {
     let mut sutures: Vec<usize> = vec![];
     let mut absorbed: Vec<usize> = vec![];
     let mut obducted: Vec<usize> = vec![];
+    let mut comp_step: HashMap<(u32, u32), (f64, u32)> = HashMap::new();
+
+    // Active trench points (lower-plate contact parcels of established subduction zones): a new
+    // convergent contact next to one of these starts subducting at once - Scotese's "subduction virus".
+    let mut trench_hash = SpatialHash::new(r_virus.max(1.5 * s));
+    {
+        let pts = w.parcels.iter().enumerate().filter_map(|(i, pc)| {
+            let b = w.binfo.get(i).copied().flatten()?;
+            if !pc.alive || b.conv <= CONV_EPS || b.dist >= r_contact { return None; }
+            let key = (pc.plate.min(b.other), pc.plate.max(b.other));
+            match w.polarity.get(&key) { Some(&sp) if sp == pc.plate => Some((i as u32, pc.pos)), _ => None }
+        });
+        trench_hash.build(pts);
+    }
 
     for i in 0..w.parcels.len() {
         let b = match w.binfo[i] { Some(b) => b, None => continue };
         let pi = w.parcels[i];
-        // Consume on any convergence once overlapping, or on deep overlap even at near-zero convergence
-        // (oblique / transform contacts must not interpenetrate).
-        let closing = (b.conv > 0.0 && b.dist < r_col) || (b.conv > -CONV_EPS && b.dist < r_deep);
-        if !pi.alive || !closing { continue; }
+        if !pi.alive || b.dist >= r_contact { continue; }
         let j = b.oidx as usize;
         let pj = w.parcels[j];
         if !pj.alive { continue; }
         let (a, bp) = (pi.plate, pj.plate);
         if a == bp { continue; }
         let key = (a.min(bp), a.max(bp));
+        // Consume on any convergence once overlapping, or on deep overlap even at near-zero convergence
+        // (oblique / transform contacts must not interpenetrate).
+        let closing = (b.conv > 0.0 && b.dist < r_col) || (b.conv > -CONV_EPS && b.dist < r_deep);
+
         let sub = match w.polarity.get(&key) {
             Some(&sp) => sp,
             None => {
-                // Subduction initiation (Rule IV: hard to start; here: first overlap decides polarity forever).
-                let sp = match (pi.kind, pj.kind) {
+                if b.conv <= CONV_EPS { continue; }
+                // Convergence without a subduction zone: the contact takes up compression (resisted in the
+                // force balance) until subduction initiates. Rule IV: subduction is hard to start.
+                let e = comp_step.entry(key).or_insert((0.0, 0));
+                e.0 += b.conv;
+                e.1 += 1;
+                let lower = match (pi.kind, pj.kind) {
                     (Kind::Oceanic, Kind::Continental) => a,
                     (Kind::Continental, Kind::Oceanic) => bp,
                     (Kind::Oceanic, Kind::Oceanic) => if pi.birth <= pj.birth { a } else { bp },
@@ -105,30 +130,47 @@ fn interact(w: &mut World) {
                         if w.plates[a as usize].n <= w.plates[bp as usize].n { a } else { bp }
                     }
                 };
-                w.polarity.insert(key, sp);
-                sp
+                let lower_p = if lower == a { &pi } else { &pj };
+                let shortened = w.pair_compress.get(&key).copied().unwrap_or(0.0);
+                let old_enough = lower_p.kind == Kind::Oceanic && t - lower_p.birth >= w.p.init_age;
+                let cc = pi.kind == Kind::Continental && pj.kind == Kind::Continental;
+                let mut virus = false;
+                {
+                    let parcels = &w.parcels;
+                    trench_hash.query(pi.pos, r_virus, |k| { if !virus && dist(parcels[k as usize].pos, pi.pos) < r_virus { virus = true; } });
+                }
+                let start = cc || virus || b.dist < r_deep || (old_enough && shortened >= 20.0) || shortened >= w.p.init_short;
+                if !start { continue; }
+                w.polarity.insert(key, lower);
+                w.pair_compress.remove(&key);
+                w.stats.initiations += 1;
+                lower
             }
         };
         if sub != a { continue; }
 
-        if pi.kind == Kind::Oceanic {
-            // Oceanic lithosphere of the lower plate is consumed; the upper plate gets an arc.
-            kills.push(i);
+        // Arc volcanism on the upper plate above every active trench segment (continuous along the arc,
+        // not only where a parcel happens to be consumed this step).
+        if pi.kind == Kind::Oceanic && b.conv > CONV_EPS {
             let hash = &w.hash;
             let parcels = &w.parcels;
-            let r_arc = w.reach(1.5, 170.0);
             hash.query(pj.pos, r_arc, |k| {
                 let pk = &parcels[k as usize];
                 if pk.alive && pk.plate == bp && dist(pk.pos, pj.pos) < r_arc { arcs.push(k as usize); }
             });
+        }
+        if !closing { continue; }
+
+        if pi.kind == Kind::Oceanic {
+            // Oceanic lithosphere of the lower plate is consumed.
+            kills.push(i);
         } else if b.conv <= CONV_EPS {
             // Continental crust grinding along a transform / near-static contact: nothing is consumed.
             continue;
         } else if pj.kind == Kind::Continental && w.pair_absorbed.get(&key).copied().unwrap_or(0) >= w.rows_lock {
-            // The collision belt has locked up after ~25 parcel-rows of shortening. The whole connected
-            // continental block of the lower plate is accreted to the upper plate in one event and the
-            // boundary re-forms behind it (Rule IV: the trench jumps over the colliding terrane). The
-            // lower plate survives as an oceanic plate, so this does not weld plates together.
+            // The collision belt has locked up after enough shortening. The whole connected continental
+            // block of the lower plate is accreted to the upper plate in one event and the boundary
+            // re-forms behind it (Rule IV: the trench jumps over the colliding terrane).
             let block = connected_continent(w, i, a);
             for &k in &block { w.parcels[k].plate = bp; }
             w.stats.accreted += block.len();
@@ -141,7 +183,7 @@ fn interact(w: &mut World) {
             let hash = &w.hash;
             let parcels = &w.parcels;
             let mut near: Vec<(usize, f64)> = vec![];
-            let (r_belt, w_belt) = (w.reach(2.5, 280.0), w.reach(1.2, 135.0));
+            let (r_belt, w_belt) = (w.reach(3.0, 350.0), w.reach(1.4, 160.0));
             hash.query(pi.pos, r_belt, |k| {
                 let pk = &parcels[k as usize];
                 if k as usize != i && pk.alive && pk.kind == Kind::Continental {
@@ -172,22 +214,33 @@ fn interact(w: &mut World) {
             sutures.push(i);
         }
     }
+    for (key, (sum, n)) in comp_step {
+        if n > 0 { *w.pair_compress.entry(key).or_insert(0.0) += sum / n as f64 * dt; }
+    }
 
     let kinfo: Vec<(V3, u32)> = kills.iter().map(|&i| (w.parcels[i].pos, w.parcels[i].plate)).collect();
     for &i in &kills { w.parcels[i].alive = false; }
-    let mut trench_marks: Vec<usize> = vec![];
+    // Flexural deepening on the lower plate: strongest at the trench, fading to the outer rise.
+    let mut trench_marks: Vec<(usize, f64)> = vec![];
     {
         let hash = &w.hash;
         let parcels = &w.parcels;
-        let r_fl = w.reach(2.5, 280.0);
         for &(pos, pl) in &kinfo {
             hash.query(pos, r_fl, |k| {
                 let pk = &parcels[k as usize];
-                if pk.alive && pk.plate == pl && dist(pk.pos, pos) < r_fl { trench_marks.push(k as usize); }
+                if pk.alive && pk.plate == pl {
+                    let d = dist(pk.pos, pos);
+                    if d < r_fl { trench_marks.push((k as usize, (1.0 - d / r_fl).powi(2))); }
+                }
             });
         }
     }
-    for k in trench_marks { w.parcels[k].trench_t = t; }
+    for (k, wgt) in trench_marks {
+        let pc = &mut w.parcels[k];
+        let prev = if t - pc.trench_t < 5.0 { pc.trench_w } else { 0.0 };
+        pc.trench_w = prev.max(wgt);
+        pc.trench_t = t;
+    }
     for &i in &absorbed { w.parcels[i].alive = false; }
     for &i in &obducted { w.parcels[i].alive = false; }
     for k in arcs { w.parcels[k].arc_t = t; }
@@ -195,7 +248,7 @@ fn interact(w: &mut World) {
     for &(i, pl) in &transfers { w.parcels[i].plate = pl; }
     for i in sutures { w.parcels[i].suture_t = t; }
     w.stats.subducted = kills.len() + obducted.len();
-    w.stats.accreted = transfers.len();
+    w.stats.accreted += transfers.len();
     w.stats.absorbed = absorbed.len();
 }
 
@@ -284,7 +337,7 @@ fn fill_gaps(w: &mut World) {
         placed.push(g);
         w.parcels.push(Parcel {
             pos: g, plate: pl, kind: Kind::Oceanic, birth: t, thick: 7.0, volc: 0.0,
-            trench_t: NEVER, suture_t: NEVER, hot_t: NEVER, arc_t: NEVER, alive: true,
+            trench_t: NEVER, suture_t: NEVER, hot_t: NEVER, arc_t: NEVER, rift_t: NEVER, trench_w: 0.0, alive: true,
         });
     }
     w.stats.created = placed.len();
@@ -302,6 +355,10 @@ fn relax(w: &mut World) {
     // Scaled by (113 km / spacing)^2 so the physical diffusivity does not depend on resolution.
     let kappa = (dt / p.erosion_tau * (113.0 / (s * R_KM)).powi(2)).min(0.45);
     let r_d = 1.6 * s;
+    let r_margin = w.reach(2.2, 250.0);
+    // Cold cratonic lithosphere (original crust, not orogenically thickened) barely erodes; young
+    // orogens and rifted margins relax. This keeps shield relief while mountain belts decay.
+    let mobility = |pc: &Parcel| -> f64 { if pc.birth < -2500.0 && pc.thick < 40.0 && pc.thick > 32.0 { 0.12 } else { 1.0 } };
     let deltas: Vec<f64> = (0..w.parcels.len()).into_par_iter().map(|i| {
         let pc = &w.parcels[i];
         if !pc.alive || pc.kind != Kind::Continental { return 0.0; }
@@ -313,7 +370,7 @@ fn relax(w: &mut World) {
                 if d < r_d { let wg = (-(d / s).powi(2)).exp(); acc += wg * (pk.thick - pc.thick); wsum += wg; }
             }
         });
-        if wsum > 0.0 { kappa * acc / wsum.max(1.0) } else { 0.0 }
+        if wsum > 0.0 { kappa * acc / wsum.max(1.0) * mobility(pc) } else { 0.0 }
     }).collect();
     let binfo = &w.binfo;
     w.parcels.par_iter_mut().enumerate().for_each(|(i, pc)| {
@@ -321,11 +378,12 @@ fn relax(w: &mut World) {
         if pc.kind == Kind::Continental {
             pc.thick += deltas[i];
             // Slow net loss of high-standing crust to the oceans (sediment leaving the continent).
-            if pc.thick > 35.0 { pc.thick -= (pc.thick - 35.0) / (4.0 * p.erosion_tau) * dt; }
-            // Stretching at a divergent boundary thins the margin (passive margin / shelf).
+            if pc.thick > 38.0 { pc.thick -= (pc.thick - 38.0) / (4.0 * p.erosion_tau) * dt; }
+            // Stretching at a divergent boundary thins the margin, most at the coast, tapering inland
+            // (a graded passive margin: shelf, slope, hinge).
             if let Some(Some(b)) = binfo.get(i) {
-                if b.conv < -CONV_EPS && b.dist < 1.5 * s {
-                    pc.thick -= p.thin_coeff * (-b.conv) * dt;
+                if b.conv < -CONV_EPS && b.dist < r_margin {
+                    pc.thick -= p.thin_coeff * (-b.conv) * dt * (1.0 - b.dist / r_margin).max(0.15);
                     if pc.thick < 20.0 { pc.thick = 20.0; }
                 }
             }
@@ -336,7 +394,7 @@ fn relax(w: &mut World) {
             if pc.kind == Kind::Continental { pc.thick += p.arc_rate * dt; } else { pc.volc += 2.5 * p.arc_rate * dt; }
         }
         pc.volc -= pc.volc / p.volc_tau * dt;
-        pc.volc = pc.volc.clamp(0.0, 8.0);
+        pc.volc = pc.volc.clamp(0.0, 6.0);
 
         // Hotspots (Rule X): build volcanic piles, leave a thermal/weakness imprint.
         for h in &hs {
@@ -441,30 +499,51 @@ fn relax(w: &mut World) {
 }
 
 fn rifting(w: &mut World) {
+    advance_rifts(w);
     let dt = w.p.dt;
     let np = w.plates.len();
+    // reference pull: slab pull on a 3000 km trench
+    let pull_ref = w.p.k_slab * (3000.0 / R_KM);
     for a in 0..np {
         let pl = w.plates[a].clone();
         if !pl.alive || (pl.n as f64) < 300.0 * w.n_scale || (pl.n_cont as f64) < 150.0 * w.n_scale { continue; }
         let cf = pl.n_cont as f64 / pl.n as f64;
         if cf < 0.15 { continue; }
-        // Tension builds on continental plates: fast when a slab is pulling on them (Rule V: Tethyan pull),
-        // slowly otherwise (thermal insulation under a stagnant supercontinent). Bigger continents offer
-        // more places to break.
-        let pulled = if pl.slab > 0.0 { 1.0 } else { 0.35 };
+        // Tension from the forces actually pulling on the plate: slab pull on its own slabs plus slab
+        // suction toward the trenches it overrides (Rule V). A stagnant plate still creeps toward failure.
+        let pulled = (0.35 + (pl.slab + pl.suction) / pull_ref).clamp(0.35, 2.5);
         let size = (pl.n_cont as f64 / (1500.0 * w.n_scale)).sqrt().clamp(0.5, 2.0);
-        let rate = pulled * size * (0.4 + 0.6 * cf) / 220.0;
+        let rate = pulled * size * (0.4 + 0.6 * cf) / 320.0;
         w.plates[a].tension += rate * dt;
         // Sutures and hot spots weaken the lithosphere (Rules X, XI).
         let weak = pl.n_weak as f64 / pl.n_cont.max(1) as f64;
         let threshold = w.p.rift_threshold / (1.0 + 3.0 * weak);
-        if w.plates[a].tension > threshold && w.rng.gen::<f64>() < w.p.rift_rate * dt {
-            if split_plate(w, a) { w.stats.rifts += 1; }
+        let busy = w.rifts.iter().any(|r| r.plate == a as u32);
+        if !busy && w.plates[a].tension > threshold && w.rng.gen::<f64>() < w.p.rift_rate * dt {
+            if nucleate_rift(w, a) { w.plates[a].tension = 0.0; }
         }
     }
 }
 
-fn split_plate(w: &mut World, a: usize) -> bool {
+/// Mean weakness of the continental crust around `p` (recent sutures, hotspot passages, thin crust).
+fn weakness_at(w: &World, p: V3) -> f64 {
+    let t = w.t;
+    let r = 1.2 * w.s;
+    let (mut sc, mut n) = (0.0, 0.0);
+    w.hash.query(p, r, |k| {
+        let pk = &w.parcels[k as usize];
+        if pk.alive && pk.kind == Kind::Continental && dist(pk.pos, p) < r {
+            n += 1.0;
+            if t - pk.suture_t < 500.0 { sc += 2.0; }
+            if t - pk.hot_t < 30.0 { sc += 1.5; }
+            if pk.thick < 31.0 { sc += 1.0; }
+        }
+    });
+    if n > 0.0 { sc / n } else { 0.0 }
+}
+
+/// Start a rift at a weak continental parcel, running perpendicular to the plate's motion.
+fn nucleate_rift(w: &mut World, a: usize) -> bool {
     let t = w.t;
     let idxs: Vec<usize> = w.parcels.iter().enumerate()
         .filter(|(_, pc)| pc.alive && pc.plate == a as u32 && pc.kind == Kind::Continental)
@@ -485,19 +564,154 @@ fn split_plate(w: &mut World, a: usize) -> bool {
     let vc = surface_velocity(w.plates[a].omega, c);
     let vn = norm(vc);
     let vhat = if vn > 1e-6 { scale(vc, 1.0 / vn) } else { any_tangent(c) };
-    // Rift line runs perpendicular to plate motion (Rule III: ridges align parallel to trenches),
-    // as a noisy great circle through the nucleus; the smaller side becomes the new plate.
-    let old_n = w.plates[a].n;
-    let mut ahead = vec![];
-    let mut behind = vec![];
-    for (i, pc) in w.parcels.iter().enumerate() {
-        if !pc.alive || pc.plate != a as u32 { continue; }
-        let side = dot(pc.pos, vhat) + 0.22 * w.weak_noise.eval(pc.pos);
-        if side > 0.0 { ahead.push(i); } else { behind.push(i); }
+    let u = normalize(cross(c, vhat));
+    w.rifts.push(ActiveRift { plate: a as u32, nucleus: c, normal: vhat, path: vec![c], tip: [c, c], dir: [u, scale(u, -1.0)], done: [false, false], born: t });
+    mark_rift(w, c);
+    true
+}
+
+/// A rift valley forms where the tip passes: flag the parcels and drop them by ~1.5 km of crust.
+fn mark_rift(w: &mut World, p: V3) {
+    let t = w.t;
+    let r = 0.9 * w.s;
+    let mut ks = vec![];
+    w.hash.query(p, r, |k| {
+        let pk = &w.parcels[k as usize];
+        if pk.alive && pk.kind == Kind::Continental && dist(pk.pos, p) < r { ks.push(k as usize); }
+    });
+    for k in ks {
+        let pc = &mut w.parcels[k];
+        if t - pc.rift_t > 5.0 { pc.thick = (pc.thick - 1.5).max(24.0); }
+        pc.rift_t = t;
     }
-    let (moved, is_ahead) = if ahead.len() <= behind.len() { (ahead, true) } else { (behind, false) };
+}
+
+/// Advance every propagating rift tip along the weakest nearby path, roughly perpendicular to plate
+/// motion; when both tips have left the continent, split the plate along the path.
+fn advance_rifts(w: &mut World) {
+    let dt = w.p.dt;
+    let t = w.t;
+    let step = w.km(w.p.rift_prop_v) * dt;
+    let mut i = 0;
+    while i < w.rifts.len() {
+        let plate = w.rifts[i].plate as usize;
+        if !w.plates[plate].alive { w.rifts.remove(i); continue; }
+        for e in 0..2 {
+            if w.rifts[i].done[e] { continue; }
+            let tip = w.rifts[i].tip[e];
+            let dir = w.rifts[i].dir[e];
+            let side = normalize(cross(tip, dir));
+            let mut best: Option<(f64, V3, V3)> = None;
+            for k in -4i32..=4 {
+                let ang = k as f64 * 15f64.to_radians();
+                let d = normalize(add(scale(dir, ang.cos()), scale(side, ang.sin())));
+                let np = move_along(tip, d, step);
+                let nd = normalize(sub(d, scale(np, dot(d, np))));
+                let weak = weakness_at(w, np);
+                let v = surface_velocity(w.plates[plate].omega, np);
+                let vn = norm(v);
+                let vh = if vn > 1e-6 { scale(v, 1.0 / vn) } else { w.rifts[i].normal };
+                let jitter = 0.3 * w.rng.gen::<f64>();
+                let score = 2.0 * ang.cos() + weak - dot(nd, vh).abs() + jitter;
+                if best.map_or(true, |(bs, _, _)| score > bs) { best = Some((score, np, nd)); }
+            }
+            let (_, np, nd) = best.unwrap();
+            let (mut inside, mut foreign) = (false, false);
+            {
+                let r = 1.2 * w.s;
+                let r2 = 1.0 * w.s;
+                w.hash.query(np, r, |k| {
+                    let pk = &w.parcels[k as usize];
+                    if !pk.alive { return; }
+                    let d = dist(pk.pos, np);
+                    if d < r && pk.plate == plate as u32 && pk.kind == Kind::Continental { inside = true; }
+                    if d < r2 && pk.plate != plate as u32 { foreign = true; }
+                });
+            }
+            w.rifts[i].tip[e] = np;
+            w.rifts[i].dir[e] = nd;
+            w.rifts[i].path.push(np);
+            if !inside || foreign { w.rifts[i].done[e] = true; } else { mark_rift(w, np); }
+        }
+        if w.rifts[i].done[0] && w.rifts[i].done[1] {
+            let r = w.rifts.remove(i);
+            if split_along(w, &r) { w.stats.rifts += 1; }
+            continue;
+        }
+        if t - w.rifts[i].born > 80.0 { w.rifts.remove(i); continue; } // stalled: a failed rift
+        i += 1;
+    }
+}
+
+/// Split plate `r.plate` along the rift path (extended straight through any oceanic crust to the plate
+/// edge). The smaller side becomes a new plate and the halves are pushed apart.
+fn split_along(w: &mut World, r: &ActiveRift) -> bool {
+    let a = r.plate as usize;
+    let s = w.s;
+    let t = w.t;
+    let mut path = r.path.clone();
+    for e in 0..2 {
+        let mut p = r.tip[e];
+        let mut d = r.dir[e];
+        for _ in 0..600 {
+            p = move_along(p, d, 0.8 * s);
+            d = normalize(sub(d, scale(p, dot(d, p))));
+            let mut on_plate = false;
+            w.hash.query(p, 1.0 * s, |k| { let pk = &w.parcels[k as usize]; if pk.alive && pk.plate == a as u32 && dist(pk.pos, p) < 1.0 * s { on_plate = true; } });
+            if !on_plate { break; }
+            path.push(p);
+        }
+    }
+    let mut barrier: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for &p in &path {
+        w.hash.query(p, 0.9 * s, |k| { let pk = &w.parcels[k as usize]; if pk.alive && pk.plate == a as u32 && dist(pk.pos, p) < 0.9 * s { barrier.insert(k as usize); } });
+    }
+    let n0 = normalize(cross(r.nucleus, r.dir[0]));
+    let seed_pt = move_along(r.nucleus, n0, 1.8 * s);
+    let mut seed: Option<(usize, f64)> = None;
+    w.hash.query(seed_pt, 2.0 * s, |k| {
+        let pk = &w.parcels[k as usize];
+        if pk.alive && pk.plate == a as u32 && !barrier.contains(&(k as usize)) {
+            let d = dist(pk.pos, seed_pt);
+            if seed.map_or(true, |(_, bd)| d < bd) { seed = Some((k as usize, d)); }
+        }
+    });
+    let Some((seed, _)) = seed else { return false };
+    let mut side_a: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut stack = vec![seed];
+    side_a.insert(seed);
+    while let Some(i) = stack.pop() {
+        let pi = w.parcels[i].pos;
+        let mut next = vec![];
+        w.hash.query(pi, 1.5 * s, |k| {
+            let pk = &w.parcels[k as usize];
+            if pk.alive && pk.plate == a as u32 && !barrier.contains(&(k as usize)) && dist(pk.pos, pi) < 1.5 * s { next.push(k as usize); }
+        });
+        for k in next { if side_a.insert(k) { stack.push(k); } }
+    }
+    let side_b: Vec<usize> = w.parcels.iter().enumerate()
+        .filter(|(i, pc)| pc.alive && pc.plate == a as u32 && !side_a.contains(i) && !barrier.contains(i))
+        .map(|(i, _)| i).collect();
     let min_n = (50.0 * w.n_scale).round() as usize;
-    if moved.len() < min_n || moved.len() + min_n > old_n { return false; }
+    if side_a.len() < min_n || side_b.len() < min_n { return false; }
+    let a_is_new = side_a.len() <= side_b.len();
+    let mut moved: std::collections::HashSet<usize> = if a_is_new { side_a.clone() } else { side_b.iter().copied().collect() };
+    // barrier parcels join whichever side their nearest non-barrier neighbour is on
+    let mut adopt = vec![];
+    for &k in &barrier {
+        let pk = w.parcels[k].pos;
+        let mut best: Option<(usize, f64)> = None;
+        w.hash.query(pk, 2.5 * s, |q| {
+            let pq = &w.parcels[q as usize];
+            if pq.alive && pq.plate == a as u32 && !barrier.contains(&(q as usize)) {
+                let d = dist(pq.pos, pk);
+                if best.map_or(true, |(_, bd)| d < bd) { best = Some((q as usize, d)); }
+            }
+        });
+        if let Some((q, _)) = best { if moved.contains(&q) { adopt.push(k); } }
+    }
+    for k in adopt { moved.insert(k); }
+    let old_n = w.plates[a].n;
     let new_id = w.plates.len() as u32;
     let mut n_cont = 0;
     for &i in &moved {
@@ -506,19 +720,19 @@ fn split_plate(w: &mut World, a: usize) -> bool {
     }
     let om = w.plates[a].omega;
     let mv = w.plates[a].mean_v;
-    w.plates.push(Plate { omega: om, alive: true, tension: 0.0, n: moved.len(), n_cont, n_weak: 0, mean_v: mv, slab: 0.0, born: t });
+    w.plates.push(Plate { omega: om, alive: true, tension: 0.0, n: moved.len(), n_cont, n_weak: 0, mean_v: mv, slab: 0.0, suction: 0.0, born: t });
     let parent_rot = w.rot[a];
     w.rot.push(parent_rot);
     // Initial separation (thermal uplift / plume push, Rule X) so ridge push can take over: 8 km/Myr
     // across the rift, shared between the halves in inverse proportion to their size.
-    let dir = if is_ahead { vhat } else { scale(vhat, -1.0) };
-    let kick = scale(cross(c, dir), 8.0 / R_KM);
-    let frac = moved.len() as f64 / old_n as f64;
+    let dir_new = if a_is_new { n0 } else { scale(n0, -1.0) };
+    let kick = scale(cross(r.nucleus, dir_new), 8.0 / R_KM);
+    let frac = moved.len() as f64 / old_n.max(1) as f64;
     w.plates[new_id as usize].omega = add(om, scale(kick, 1.0 - frac));
     w.plates[a].omega = sub(om, scale(kick, frac));
     w.rift_pairs.insert(((a as u32).min(new_id), (a as u32).max(new_id)), t);
     w.plates[a].tension = 0.0;
-    w.plates[a].n -= moved.len();
+    w.plates[a].n = old_n.saturating_sub(moved.len());
     w.plates[a].n_cont = w.plates[a].n_cont.saturating_sub(n_cont);
     true
 }
@@ -619,6 +833,7 @@ fn merge_and_cleanup(w: &mut World) {
     let alive: Vec<bool> = w.plates.iter().map(|p| p.alive).collect();
     w.polarity.retain(|&(a, b), _| a != b && alive[a as usize] && alive[b as usize]);
     w.pair_absorbed.retain(|&(a, b), _| a != b && alive[a as usize] && alive[b as usize]);
+    w.pair_compress.retain(|&(a, b), _| a != b && alive[a as usize] && alive[b as usize]);
     w.static_myr.retain(|&(a, b), _| a != b && alive[a as usize] && alive[b as usize]);
     let (t_now, push_myr) = (w.t, w.p.rift_push_myr);
     w.rift_pairs.retain(|&(a, b), &mut tr| a != b && alive[a as usize] && alive[b as usize] && t_now - tr < push_myr + 1.0);

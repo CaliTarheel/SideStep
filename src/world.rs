@@ -31,6 +31,10 @@ pub struct Parcel {
     pub hot_t: f64,
     /// Last time this parcel was on the upper plate right above an active trench (arc volcanism).
     pub arc_t: f64,
+    /// Last time a propagating rift passed through this parcel.
+    pub rift_t: f64,
+    /// Flexural deepening weight (1 at the trench, 0 at the outer edge of the flexural bulge).
+    pub trench_w: f64,
     pub alive: bool,
 }
 
@@ -44,8 +48,23 @@ pub struct Plate {
     pub n_cont: usize,
     pub n_weak: usize,
     pub mean_v: f64,
-    /// Total slab pull + slab suction magnitude acting on this plate last step.
+    /// Total slab-pull magnitude acting on this plate last step.
     pub slab: f64,
+    /// Total slab-suction magnitude acting on this plate last step.
+    pub suction: f64,
+    pub born: f64,
+}
+
+/// A rift propagating through a continent; when both tips reach the ocean the plate is split along the path.
+#[derive(Clone, Debug)]
+pub struct ActiveRift {
+    pub plate: u32,
+    pub nucleus: V3,
+    pub normal: V3,
+    pub path: Vec<V3>,
+    pub tip: [V3; 2],
+    pub dir: [V3; 2],
+    pub done: [bool; 2],
     pub born: f64,
 }
 
@@ -69,6 +88,7 @@ pub struct Stats {
     pub absorbed: usize,
     pub cont_lost: usize,
     pub cont_grown: usize,
+    pub initiations: usize,
     pub rifts: usize,
     pub merges: usize,
     pub mean_v: f64,
@@ -100,6 +120,16 @@ pub struct Params {
     pub k_rift: f64,
     /// How long after a split the rift push acts (Myr).
     pub rift_push_myr: f64,
+    /// Rift tip propagation speed (km/Myr).
+    pub rift_prop_v: f64,
+    /// Resistance at a convergent contact that has no subduction zone yet (per unit length).
+    pub k_resist: f64,
+    /// Oceanic lithosphere this old (Myr) can start subducting after a little compression.
+    pub init_age: f64,
+    /// Accumulated shortening (km) that forces subduction to start regardless of age.
+    pub init_short: f64,
+    /// A convergent contact this close (km) to an existing trench starts subducting at once ("virus").
+    pub virus_km: f64,
     pub drag_ocean: f64,
     pub drag_cont: f64,
     /// Phanerozoic speed limit, km/Myr (Rule II: ~20 cm/yr).
@@ -123,11 +153,11 @@ impl Params {
     pub fn default() -> Params {
         Params {
             seed: 42, n_parcels: 40_000, n_plates: 12, years: 1000.0, dt: 1.0, slice_every: 10.0,
-            width: 1024, out: "out/run".into(), cont_frac: 0.30, n_hotspots: 24,
-            k_slab: 0.015, k_ridge: 0.004, k_coll: 0.2, k_suction: 0.003, k_rift: 0.012, rift_push_myr: 60.0, drag_ocean: 1.0, drag_cont: 3.0,
+            width: 1024, out: "out/run".into(), cont_frac: 0.30, n_hotspots: 12,
+            k_slab: 0.015, k_ridge: 0.004, k_coll: 0.2, k_suction: 0.003, k_rift: 0.012, rift_push_myr: 60.0, rift_prop_v: 150.0, k_resist: 0.05, init_age: 60.0, init_short: 150.0, virus_km: 600.0, drag_ocean: 1.0, drag_cont: 3.0,
             v_max: 200.0, omega_relax: 0.5,
             rift_threshold: 1.0, rift_rate: 0.05,
-            arc_rate: 0.04, hot_rate: 3.0, erosion_tau: 25.0, volc_tau: 60.0,
+            arc_rate: 0.04, hot_rate: 2.0, erosion_tau: 40.0, volc_tau: 60.0,
             thick_coeff: 0.015, thin_coeff: 0.011, accrete_rate: 0.01,
         }
     }
@@ -162,6 +192,11 @@ impl Params {
                 "k-suction" => p.k_suction = f(),
                 "k-rift" => p.k_rift = f(),
                 "rift-push-myr" => p.rift_push_myr = f(),
+                "rift-prop-v" => p.rift_prop_v = f(),
+                "k-resist" => p.k_resist = f(),
+                "init-age" => p.init_age = f(),
+                "init-short" => p.init_short = f(),
+                "virus-km" => p.virus_km = f(),
                 "drag-ocean" => p.drag_ocean = f(),
                 "drag-cont" => p.drag_cont = f(),
                 "v-max" => p.v_max = f(),
@@ -202,7 +237,8 @@ const HELP: &str = "tectonic - time-evolved spherical plate tectonics (Scotese r
   --out DIR           output directory (out/run)
   --cont-frac F       initial continental area fraction (0.30)
   --hotspots N        fixed mantle plumes (24)
-  physics: --k-slab --k-ridge --k-coll --k-suction --k-rift --rift-push-myr --drag-ocean --drag-cont --v-max --omega-relax
+  physics: --k-slab --k-ridge --k-coll --k-suction --k-rift --rift-push-myr --rift-prop-v
+           --k-resist --init-age --init-short --virus-km --drag-ocean --drag-cont --v-max --omega-relax
            --rift-threshold --rift-rate --arc-rate --hot-rate --erosion-tau --volc-tau
            --thick-coeff --thin-coeff --accrete-rate";
 
@@ -234,6 +270,13 @@ pub struct World {
     pub rift_pairs: HashMap<(u32, u32), f64>,
     /// How long (Myr) each plate pair's contact has had essentially no relative motion.
     pub static_myr: HashMap<(u32, u32), f64>,
+    /// Shortening (km) taken up at convergent contacts that have not started subducting yet.
+    pub pair_compress: HashMap<(u32, u32), f64>,
+    /// Rifts currently propagating.
+    pub rifts: Vec<ActiveRift>,
+    /// Ocean volume at t = 0 (mean water column per parcel, m) and the current eustatic sea level (m).
+    pub sea_v0: Option<f64>,
+    pub sea_level: f64,
     pub rng: ChaCha8Rng,
     pub hash: SpatialHash,
     pub binfo: Vec<Option<BInfo>>,
@@ -294,13 +337,13 @@ impl World {
                 }
             }
             let birth = if kind == Kind::Continental { -3000.0 } else { -(70.0 + 60.0 * age_noise.eval(pos)).clamp(2.0, 160.0) };
-            parcels.push(Parcel { pos, plate: best.0, kind, birth, thick, volc: 0.0, trench_t: NEVER, suture_t: NEVER, hot_t: NEVER, arc_t: NEVER, alive: true });
+            parcels.push(Parcel { pos, plate: best.0, kind, birth, thick, volc: 0.0, trench_t: NEVER, suture_t: NEVER, hot_t: NEVER, arc_t: NEVER, rift_t: NEVER, trench_w: 0.0, alive: true });
         }
 
         let plates = (0..p.n_plates).map(|_| {
             let axis = random_unit(&mut rng);
             let v = rng.gen_range(10.0..40.0);
-            Plate { omega: scale(axis, v / R_KM), alive: true, tension: 0.0, n: 0, n_cont: 0, n_weak: 0, mean_v: v, slab: 0.0, born: 0.0 }
+            Plate { omega: scale(axis, v / R_KM), alive: true, tension: 0.0, n: 0, n_cont: 0, n_weak: 0, mean_v: v, slab: 0.0, suction: 0.0, born: 0.0 }
         }).collect();
         let hotspots = (0..p.n_hotspots).map(|_| random_unit(&mut rng)).collect();
         let weak_noise = Noise::new(&mut rng, 8, 6.0, 18.0);
@@ -311,7 +354,7 @@ impl World {
         let mut w = World {
             hash: SpatialHash::new(1.5 * s), p, t: 0.0, s, n_scale, rows_lock,
             rot: vec![IDENT; n_plates], rot_hist: vec![], parcels, plates, grid, hotspots,
-            polarity: HashMap::new(), pair_absorbed: HashMap::new(), pair_ccf: HashMap::new(), rift_pairs: HashMap::new(), static_myr: HashMap::new(), rng, binfo: vec![], stats: Stats::default(), weak_noise,
+            polarity: HashMap::new(), pair_absorbed: HashMap::new(), pair_ccf: HashMap::new(), rift_pairs: HashMap::new(), static_myr: HashMap::new(), pair_compress: HashMap::new(), rifts: vec![], sea_v0: None, sea_level: 0.0, rng, binfo: vec![], stats: Stats::default(), weak_noise,
         };
         w.rebuild_hash();
         crate::step::plate_stats(&mut w);

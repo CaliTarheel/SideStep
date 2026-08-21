@@ -85,6 +85,12 @@ less than a spacing per step:
 ```
 
 This takes ~15× longer than the 40K default (about 25 minutes for 1000 Myr on 12 cores).
+Three times the default linear resolution (37 km spacing, 360K parcels, 3072-px maps) is
+about 90 minutes:
+
+```bash
+./target/release/tectonic --parcels 360000 --width 3072 --dt 0.33 --out out/hr360
+```
 
 The physical resolution is the parcel spacing (113 km at 40K, 56 km at 160K), not the pixel
 count: the renderer samples each pixel with a Gaussian of half a spacing, so features smaller
@@ -108,9 +114,11 @@ equator (1024 px ≈ 39 km/px, 2048 px ≈ 20 km/px).
 Validated on three seeds at 40K and one at 160K parcels over 1000 Myr: 6–16 plates throughout,
 Earth-like speeds (mean 10–35 km/Myr), 11–22 rifts per Gyr, continents stay coherent,
 collision belts form and lock, failed rifts close and fill, hotspot chains and shelves persist.
-Known gaps: continental area drifts a few percent per Gyr, fixed sea level, no back-arc basins,
-subduction initiates on first contact (no difficulty), relief is coarse and continental
-interiors are flat (needs an amplification stage). See [docs/RULES.md](docs/RULES.md).
+Subduction initiates only after compression builds (old passive margins, exhausted shortening
+budget, or next to an existing trench); rifts nucleate at weaknesses and propagate along them
+before splitting a plate; sea level is eustatic. Known gaps: continental area drifts a few
+percent per Gyr, no back-arc basins or rollback, no fracture zones, relief is coarse at the parcel
+scale (needs an amplification stage). See [docs/RULES.md](docs/RULES.md).
 
 ## Reference
 

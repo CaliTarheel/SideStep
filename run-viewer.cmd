@@ -2,7 +2,7 @@
 rem Start the tectonic globe viewer. Usage: run-viewer.cmd [run_dir] [port]
 setlocal
 set RUN=%~1
-if "%RUN%"=="" set RUN=out\hires42
+if "%RUN%"=="" set RUN=out\hr360
 set PORT=%~2
 if "%PORT%"=="" set PORT=8077
 cd /d "%~dp0"
