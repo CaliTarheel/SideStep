@@ -1,0 +1,15 @@
+[package]
+name = "tectonic"
+version = "0.1.0"
+edition = "2021"
+description = "Time-evolved spherical plate tectonics engine built on Scotese's 'Rules of Thumb'"
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+rand = "0.8"
+rand_chacha = "0.3"
+rayon = "1.10"
+
+[profile.release]
+opt-level = 3
+debug = 1

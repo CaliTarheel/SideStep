@@ -1,0 +1,655 @@
+//! One time step: advect, detect boundaries, subduct/collide, create crust at gaps,
+//! evolve crust (erosion, hotspots, rift thinning), force balance, rifting, suturing, cleanup.
+use crate::geom::*;
+use crate::world::*;
+use rand::Rng;
+use rayon::prelude::*;
+use std::collections::HashMap;
+
+pub fn step(w: &mut World) {
+    w.stats = Stats::default();
+    let dt = w.p.dt;
+
+    // 1. Rigid-plate advection (and accumulate each plate's finite rotation for export).
+    for pc in w.parcels.iter_mut() {
+        if pc.alive {
+            let om = w.plates[pc.plate as usize].omega;
+            pc.pos = rotate(pc.pos, om, dt);
+        }
+    }
+    for (i, pl) in w.plates.iter().enumerate() {
+        if pl.alive { w.rot[i] = mat_mul(rot_matrix(pl.omega, dt), w.rot[i]); }
+    }
+    w.rebuild_hash();
+    // 2. Boundary detection.
+    w.binfo = detect(w);
+    // 3. Subduction, collision, accretion.
+    interact(w);
+    // 4. New crust at divergent gaps (Rule III: ridges are passive - crust breaks because it is pulled).
+    fill_gaps(w);
+    // 5. Crust evolution.
+    relax(w);
+    // 6. Force balance -> plate velocities.
+    crate::forces::update_omegas(w);
+    // 7. Continental rifting.
+    rifting(w);
+    // 8. Suturing and removal of consumed plates.
+    merge_and_cleanup(w);
+    plate_stats(w);
+    w.rebuild_hash();
+    w.t += dt;
+}
+
+fn detect(w: &World) -> Vec<Option<BInfo>> {
+    let r = 1.5 * w.s;
+    (0..w.parcels.len())
+        .into_par_iter()
+        .map(|i| {
+            let pi = &w.parcels[i];
+            if !pi.alive { return None; }
+            let mut best: Option<(u32, f64)> = None;
+            w.hash.query(pi.pos, r, |j| {
+                let pj = &w.parcels[j as usize];
+                if pj.alive && pj.plate != pi.plate {
+                    let d = dist(pi.pos, pj.pos);
+                    if d < r && best.map_or(true, |(_, bd)| d < bd) { best = Some((j, d)); }
+                }
+            });
+            best.map(|(j, d)| {
+                let pj = &w.parcels[j as usize];
+                let n = tangent_toward(pi.pos, pj.pos);
+                let vi = surface_velocity(w.plates[pi.plate as usize].omega, pi.pos);
+                let vj = surface_velocity(w.plates[pj.plate as usize].omega, pj.pos);
+                BInfo { other: pj.plate, oidx: j, n, conv: dot(sub(vi, vj), n), dist: d }
+            })
+        })
+        .collect()
+}
+
+fn interact(w: &mut World) {
+    let t = w.t;
+    let s = w.s;
+    let dt = w.p.dt;
+    let r_col = 0.8 * s;
+    let r_deep = 0.45 * s;
+    let mut kills: Vec<usize> = vec![];
+    let mut arcs: Vec<usize> = vec![];
+    let mut thick_add: Vec<(usize, f64)> = vec![];
+    let mut transfers: Vec<(usize, u32)> = vec![];
+    let mut sutures: Vec<usize> = vec![];
+    let mut absorbed: Vec<usize> = vec![];
+    let mut obducted: Vec<usize> = vec![];
+
+    for i in 0..w.parcels.len() {
+        let b = match w.binfo[i] { Some(b) => b, None => continue };
+        let pi = w.parcels[i];
+        // Consume on any convergence once overlapping, or on deep overlap even at near-zero convergence
+        // (oblique / transform contacts must not interpenetrate).
+        let closing = (b.conv > 0.0 && b.dist < r_col) || (b.conv > -CONV_EPS && b.dist < r_deep);
+        if !pi.alive || !closing { continue; }
+        let j = b.oidx as usize;
+        let pj = w.parcels[j];
+        if !pj.alive { continue; }
+        let (a, bp) = (pi.plate, pj.plate);
+        if a == bp { continue; }
+        let key = (a.min(bp), a.max(bp));
+        let sub = match w.polarity.get(&key) {
+            Some(&sp) => sp,
+            None => {
+                // Subduction initiation (Rule IV: hard to start; here: first overlap decides polarity forever).
+                let sp = match (pi.kind, pj.kind) {
+                    (Kind::Oceanic, Kind::Continental) => a,
+                    (Kind::Continental, Kind::Oceanic) => bp,
+                    (Kind::Oceanic, Kind::Oceanic) => if pi.birth <= pj.birth { a } else { bp },
+                    (Kind::Continental, Kind::Continental) => {
+                        if w.plates[a as usize].n <= w.plates[bp as usize].n { a } else { bp }
+                    }
+                };
+                w.polarity.insert(key, sp);
+                sp
+            }
+        };
+        if sub != a { continue; }
+
+        if pi.kind == Kind::Oceanic {
+            // Oceanic lithosphere of the lower plate is consumed; the upper plate gets an arc.
+            kills.push(i);
+            let hash = &w.hash;
+            let parcels = &w.parcels;
+            let r_arc = w.reach(1.5, 170.0);
+            hash.query(pj.pos, r_arc, |k| {
+                let pk = &parcels[k as usize];
+                if pk.alive && pk.plate == bp && dist(pk.pos, pj.pos) < r_arc { arcs.push(k as usize); }
+            });
+        } else if b.conv <= CONV_EPS {
+            // Continental crust grinding along a transform / near-static contact: nothing is consumed.
+            continue;
+        } else if pj.kind == Kind::Continental && w.pair_absorbed.get(&key).copied().unwrap_or(0) >= w.rows_lock {
+            // The collision belt has locked up after ~25 parcel-rows of shortening. The whole connected
+            // continental block of the lower plate is accreted to the upper plate in one event and the
+            // boundary re-forms behind it (Rule IV: the trench jumps over the colliding terrane). The
+            // lower plate survives as an oceanic plate, so this does not weld plates together.
+            let block = connected_continent(w, i, a);
+            for &k in &block { w.parcels[k].plate = bp; }
+            w.stats.accreted += block.len();
+            sutures.push(i);
+            sutures.push(j);
+            w.pair_absorbed.remove(&key);
+        } else if pj.kind == Kind::Continental {
+            // Continent-continent collision: the arriving parcel is absorbed (shortening). Its crustal
+            // volume thickens the surrounding belt on both plates (volume-conserving); the contact is a suture.
+            let hash = &w.hash;
+            let parcels = &w.parcels;
+            let mut near: Vec<(usize, f64)> = vec![];
+            let (r_belt, w_belt) = (w.reach(2.5, 280.0), w.reach(1.2, 135.0));
+            hash.query(pi.pos, r_belt, |k| {
+                let pk = &parcels[k as usize];
+                if k as usize != i && pk.alive && pk.kind == Kind::Continental {
+                    let d = dist(pk.pos, pi.pos);
+                    if d < r_belt { near.push((k as usize, (-(d / w_belt).powi(2)).exp())); }
+                }
+            });
+            if near.is_empty() { continue; }
+            let wsum: f64 = near.iter().map(|x| x.1).sum::<f64>().max(1e-9);
+            for (k, wk) in &near { thick_add.push((*k, pi.thick * wk / wsum)); sutures.push(*k); }
+            absorbed.push(i);
+            *w.pair_absorbed.entry(key).or_insert(0) += 1;
+        } else if pi.thick < 33.0 && !attached_to_continent(w, i) {
+            // Thin, isolated continental slivers (old arcs, stretched shelf) go down with the slab at
+            // intra-oceanic trenches - island arcs do not ride across oceans (Rule VIII).
+            kills.push(i);
+            w.stats.cont_lost += 1;
+        } else {
+            // Continent arriving at an intra-oceanic trench: it docks onto the upper plate (terrane accretion);
+            // the oceanic crust it overrides is obducted (removed). Subduction then resumes behind it (Rule IV).
+            let hash = &w.hash;
+            let parcels = &w.parcels;
+            hash.query(pi.pos, 0.8 * s, |k| {
+                let pk = &parcels[k as usize];
+                if pk.alive && pk.plate == bp && pk.kind == Kind::Oceanic && dist(pk.pos, pi.pos) < 0.8 * s { obducted.push(k as usize); }
+            });
+            transfers.push((i, bp));
+            sutures.push(i);
+        }
+    }
+
+    let kinfo: Vec<(V3, u32)> = kills.iter().map(|&i| (w.parcels[i].pos, w.parcels[i].plate)).collect();
+    for &i in &kills { w.parcels[i].alive = false; }
+    let mut trench_marks: Vec<usize> = vec![];
+    {
+        let hash = &w.hash;
+        let parcels = &w.parcels;
+        let r_fl = w.reach(2.5, 280.0);
+        for &(pos, pl) in &kinfo {
+            hash.query(pos, r_fl, |k| {
+                let pk = &parcels[k as usize];
+                if pk.alive && pk.plate == pl && dist(pk.pos, pos) < r_fl { trench_marks.push(k as usize); }
+            });
+        }
+    }
+    for k in trench_marks { w.parcels[k].trench_t = t; }
+    for &i in &absorbed { w.parcels[i].alive = false; }
+    for &i in &obducted { w.parcels[i].alive = false; }
+    for k in arcs { w.parcels[k].arc_t = t; }
+    for (k, v) in thick_add { w.parcels[k].thick += v; }
+    for &(i, pl) in &transfers { w.parcels[i].plate = pl; }
+    for i in sutures { w.parcels[i].suture_t = t; }
+    w.stats.subducted = kills.len() + obducted.len();
+    w.stats.accreted = transfers.len();
+    w.stats.absorbed = absorbed.len();
+}
+
+/// Flood-fill the connected continental block of plate `plate` that contains parcel `start`
+/// (links: continental parcels of the same plate within 1.5 spacings).
+fn connected_continent(w: &World, start: usize, plate: u32) -> Vec<usize> {
+    let s = w.s;
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![start];
+    let mut out = vec![];
+    seen.insert(start);
+    while let Some(i) = stack.pop() {
+        out.push(i);
+        let pi = w.parcels[i].pos;
+        let mut next = vec![];
+        w.hash.query(pi, 1.5 * s, |k| {
+            let pk = &w.parcels[k as usize];
+            if pk.alive && pk.plate == plate && pk.kind == Kind::Continental && dist(pk.pos, pi) < 1.5 * s { next.push(k as usize); }
+        });
+        for k in next { if seen.insert(k) { stack.push(k); } }
+    }
+    out
+}
+
+/// True if parcel `i` has a neighbouring continental parcel of normal thickness within 1.5 spacings.
+fn attached_to_continent(w: &World, i: usize) -> bool {
+    let pi = &w.parcels[i];
+    let s = w.s;
+    let mut found = false;
+    w.hash.query(pi.pos, 1.5 * s, |k| {
+        if found || k as usize == i { return; }
+        let pk = &w.parcels[k as usize];
+        if pk.alive && pk.kind == Kind::Continental && pk.thick >= 33.0 && dist(pk.pos, pi.pos) < 1.5 * s { found = true; }
+    });
+    found
+}
+
+fn fill_gaps(w: &mut World) {
+    let s = w.s;
+    let r_gap = 0.9 * s;
+    let r_search = 2.0 * s;
+    let mut cands: Vec<(usize, f64, u32)> = w
+        .grid
+        .par_iter()
+        .enumerate()
+        .filter_map(|(gi, &g)| {
+            let mut best: Option<(u32, f64)> = None;
+            w.hash.query(g, r_search, |j| {
+                let pj = &w.parcels[j as usize];
+                if pj.alive {
+                    let d = dist(pj.pos, g);
+                    if d < r_search && best.map_or(true, |(_, bd)| d < bd) { best = Some((j, d)); }
+                }
+            });
+            match best {
+                Some((j, d)) if d > r_gap => {
+                    // Never create crust inside a closing (convergent) boundary.
+                    if let Some(b) = w.binfo[j as usize] {
+                        if b.conv > CONV_EPS && b.dist < 1.5 * s { return None; }
+                    }
+                    // Ownership by weighted majority of nearby parcels (coherent patches, not interleaving).
+                    let mut votes: Vec<(u32, f64)> = Vec::with_capacity(4);
+                    w.hash.query(g, r_search, |k| {
+                        let pk = &w.parcels[k as usize];
+                        if pk.alive {
+                            let dk = dist(pk.pos, g);
+                            if dk < r_search {
+                                let wgt = (-(dk / s).powi(2)).exp();
+                                match votes.iter_mut().find(|v| v.0 == pk.plate) { Some(v) => v.1 += wgt, None => votes.push((pk.plate, wgt)) }
+                            }
+                        }
+                    });
+                    let owner = votes.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).map(|v| v.0).unwrap_or(w.parcels[j as usize].plate);
+                    Some((gi, d, owner))
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    cands.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    let mut placed: Vec<V3> = vec![];
+    let t = w.t;
+    for (gi, _, pl) in cands {
+        let g = w.grid[gi];
+        if placed.iter().any(|&q| dist(q, g) < 0.85 * s) { continue; }
+        placed.push(g);
+        w.parcels.push(Parcel {
+            pos: g, plate: pl, kind: Kind::Oceanic, birth: t, thick: 7.0, volc: 0.0,
+            trench_t: NEVER, suture_t: NEVER, hot_t: NEVER, arc_t: NEVER, alive: true,
+        });
+    }
+    w.stats.created = placed.len();
+}
+
+fn relax(w: &mut World) {
+    let dt = w.p.dt;
+    let t = w.t;
+    let s = w.s;
+    let r_hot = w.reach(0.8, 90.0);
+    let p = w.p.clone();
+    let hs = w.hotspots.clone();
+    // Erosion as diffusion of crustal thickness between neighbouring continental parcels
+    // (volume-conserving: mountains shed into their forelands and shelves), plus a slow loss term.
+    // Scaled by (113 km / spacing)^2 so the physical diffusivity does not depend on resolution.
+    let kappa = (dt / p.erosion_tau * (113.0 / (s * R_KM)).powi(2)).min(0.45);
+    let r_d = 1.6 * s;
+    let deltas: Vec<f64> = (0..w.parcels.len()).into_par_iter().map(|i| {
+        let pc = &w.parcels[i];
+        if !pc.alive || pc.kind != Kind::Continental { return 0.0; }
+        let (mut acc, mut wsum) = (0.0, 0.0);
+        w.hash.query(pc.pos, r_d, |k| {
+            let pk = &w.parcels[k as usize];
+            if k as usize != i && pk.alive && pk.kind == Kind::Continental {
+                let d = dist(pk.pos, pc.pos);
+                if d < r_d { let wg = (-(d / s).powi(2)).exp(); acc += wg * (pk.thick - pc.thick); wsum += wg; }
+            }
+        });
+        if wsum > 0.0 { kappa * acc / wsum.max(1.0) } else { 0.0 }
+    }).collect();
+    let binfo = &w.binfo;
+    w.parcels.par_iter_mut().enumerate().for_each(|(i, pc)| {
+        if !pc.alive { return; }
+        if pc.kind == Kind::Continental {
+            pc.thick += deltas[i];
+            // Slow net loss of high-standing crust to the oceans (sediment leaving the continent).
+            if pc.thick > 35.0 { pc.thick -= (pc.thick - 35.0) / (4.0 * p.erosion_tau) * dt; }
+            // Stretching at a divergent boundary thins the margin (passive margin / shelf).
+            if let Some(Some(b)) = binfo.get(i) {
+                if b.conv < -CONV_EPS && b.dist < 1.5 * s {
+                    pc.thick -= p.thin_coeff * (-b.conv) * dt;
+                    if pc.thick < 20.0 { pc.thick = 20.0; }
+                }
+            }
+            if pc.thick > 70.0 { pc.thick = 70.0; }
+        }
+        // Arc volcanism on the upper plate: thickens continental crust, builds island arcs on oceanic crust.
+        if pc.arc_t == t {
+            if pc.kind == Kind::Continental { pc.thick += p.arc_rate * dt; } else { pc.volc += 2.5 * p.arc_rate * dt; }
+        }
+        pc.volc -= pc.volc / p.volc_tau * dt;
+        pc.volc = pc.volc.clamp(0.0, 8.0);
+
+        // Hotspots (Rule X): build volcanic piles, leave a thermal/weakness imprint.
+        for h in &hs {
+            if dist(*h, pc.pos) < r_hot {
+                pc.hot_t = t;
+                pc.volc += if pc.kind == Kind::Oceanic { p.hot_rate } else { 0.3 * p.hot_rate } * dt;
+            }
+        }
+    });
+    // Failed rifts fill: an intraplate strip of ocean floor enclosed by continental crust subsides under
+    // sediment into a shallow basin (aulacogen) - it becomes thin continental crust, not a deep slot.
+    {
+        let r_n = 1.6 * s;
+        let binfo = &w.binfo;
+        let fill: Vec<usize> = (0..w.parcels.len()).into_par_iter().filter(|&i| {
+            let pc = &w.parcels[i];
+            if !pc.alive || pc.kind != Kind::Oceanic || t - pc.birth < 15.0 { return false; }
+            if let Some(Some(_)) = binfo.get(i) { return false; } // at a live plate boundary
+            let (mut n_all, mut n_cont) = (0usize, 0usize);
+            let mut resultant = [0.0; 3];
+            w.hash.query(pc.pos, r_n, |k| {
+                let pk = &w.parcels[k as usize];
+                if k as usize != i && pk.alive && dist(pk.pos, pc.pos) < r_n {
+                    n_all += 1;
+                    if pk.kind == Kind::Continental && pk.plate == pc.plate {
+                        n_cont += 1;
+                        resultant = add(resultant, tangent_toward(pc.pos, pk.pos));
+                    }
+                }
+            });
+            // Enclosed, not merely bordered: continental neighbours must lie on opposing sides
+            // (short resultant), otherwise every passive margin would creep seaward row by row.
+            n_cont >= 4 && n_cont * 2 >= n_all && norm(resultant) / (n_cont as f64) < 0.45
+        }).collect();
+        for i in fill {
+            let pc = &mut w.parcels[i];
+            pc.kind = Kind::Continental;
+            pc.thick = 28.0;
+            pc.volc = 0.0;
+            pc.birth = t;
+            pc.trench_t = NEVER;
+        }
+    }
+    // Accretionary / forearc growth at continental arcs: the margin slowly builds seaward (juvenile crust).
+    {
+        let mut grow: Vec<usize> = vec![];
+        {
+            let hash = &w.hash;
+            let parcels = &w.parcels;
+            for (i, pc) in parcels.iter().enumerate() {
+                if !(pc.alive && pc.kind == Kind::Continental && pc.arc_t == t && pc.thick >= 33.0) { continue; }
+                if w.rng_f64_hash(i) >= p.accrete_rate * dt { continue; }
+                let mut best: Option<(usize, f64)> = None;
+                hash.query(pc.pos, 1.4 * s, |k| {
+                    let pk = &parcels[k as usize];
+                    if pk.alive && pk.kind == Kind::Oceanic && pk.plate == pc.plate {
+                        let d = dist(pk.pos, pc.pos);
+                        if d < 1.4 * s && best.map_or(true, |(_, bd)| d < bd) { best = Some((k as usize, d)); }
+                    }
+                });
+                if let Some((k, _)) = best { grow.push(k); }
+            }
+        }
+        for k in grow {
+            let pk = &mut w.parcels[k];
+            if pk.kind != Kind::Oceanic { continue; }
+            pk.kind = Kind::Continental;
+            pk.thick = 33.5;
+            pk.volc = 0.0;
+            pk.birth = t;
+            w.stats.cont_grown += 1;
+        }
+    }
+    // A mature island arc is new continental crust (continents grow at arcs). Conversion happens in
+    // contiguous segments: a parcel with a big pile converts together with its arc neighbours.
+    let mut mature: Vec<usize> = vec![];
+    {
+        let hash = &w.hash;
+        let parcels = &w.parcels;
+        for (i, pc) in parcels.iter().enumerate() {
+            if !(pc.alive && pc.kind == Kind::Oceanic && pc.arc_t == t && pc.volc >= 5.0) { continue; }
+            let mut seg = vec![i];
+            hash.query(pc.pos, 1.3 * s, |k| {
+                let pk = &parcels[k as usize];
+                if k as usize != i && pk.alive && pk.kind == Kind::Oceanic && pk.plate == pc.plate && pk.volc >= 2.0 && dist(pk.pos, pc.pos) < 1.3 * s {
+                    seg.push(k as usize);
+                }
+            });
+            if seg.len() >= (3.0 * w.n_scale.sqrt()).round() as usize { mature.extend(seg); }
+        }
+    }
+    for i in mature {
+        let pc = &mut w.parcels[i];
+        if pc.kind != Kind::Oceanic { continue; }
+        w.stats.cont_grown += 1;
+        let depth = (2600.0 + 350.0 * (t - pc.birth).max(0.0).sqrt()).min(5700.0);
+        pc.kind = Kind::Continental;
+        pc.thick = (32.8 + (pc.volc * 1000.0 - depth) / 180.0).clamp(30.0, 38.0);
+        pc.volc = 0.0;
+        pc.birth = t;
+    }
+}
+
+fn rifting(w: &mut World) {
+    let dt = w.p.dt;
+    let np = w.plates.len();
+    for a in 0..np {
+        let pl = w.plates[a].clone();
+        if !pl.alive || (pl.n as f64) < 300.0 * w.n_scale || (pl.n_cont as f64) < 150.0 * w.n_scale { continue; }
+        let cf = pl.n_cont as f64 / pl.n as f64;
+        if cf < 0.15 { continue; }
+        // Tension builds on continental plates: fast when a slab is pulling on them (Rule V: Tethyan pull),
+        // slowly otherwise (thermal insulation under a stagnant supercontinent). Bigger continents offer
+        // more places to break.
+        let pulled = if pl.slab > 0.0 { 1.0 } else { 0.35 };
+        let size = (pl.n_cont as f64 / (1500.0 * w.n_scale)).sqrt().clamp(0.5, 2.0);
+        let rate = pulled * size * (0.4 + 0.6 * cf) / 220.0;
+        w.plates[a].tension += rate * dt;
+        // Sutures and hot spots weaken the lithosphere (Rules X, XI).
+        let weak = pl.n_weak as f64 / pl.n_cont.max(1) as f64;
+        let threshold = w.p.rift_threshold / (1.0 + 3.0 * weak);
+        if w.plates[a].tension > threshold && w.rng.gen::<f64>() < w.p.rift_rate * dt {
+            if split_plate(w, a) { w.stats.rifts += 1; }
+        }
+    }
+}
+
+fn split_plate(w: &mut World, a: usize) -> bool {
+    let t = w.t;
+    let idxs: Vec<usize> = w.parcels.iter().enumerate()
+        .filter(|(_, pc)| pc.alive && pc.plate == a as u32 && pc.kind == Kind::Continental)
+        .map(|(i, _)| i).collect();
+    if idxs.is_empty() { return false; }
+    let weights: Vec<f64> = idxs.iter().map(|&i| {
+        let pc = &w.parcels[i];
+        1.0 + if t - pc.suture_t < 500.0 { 5.0 } else { 0.0 } + if t - pc.hot_t < 30.0 { 3.0 } else { 0.0 }
+    }).collect();
+    let total: f64 = weights.iter().sum();
+    let mut pick = w.rng.gen::<f64>() * total;
+    let mut nucleus = idxs[0];
+    for (k, &i) in idxs.iter().enumerate() {
+        pick -= weights[k];
+        if pick <= 0.0 { nucleus = i; break; }
+    }
+    let c = w.parcels[nucleus].pos;
+    let vc = surface_velocity(w.plates[a].omega, c);
+    let vn = norm(vc);
+    let vhat = if vn > 1e-6 { scale(vc, 1.0 / vn) } else { any_tangent(c) };
+    // Rift line runs perpendicular to plate motion (Rule III: ridges align parallel to trenches),
+    // as a noisy great circle through the nucleus; the smaller side becomes the new plate.
+    let old_n = w.plates[a].n;
+    let mut ahead = vec![];
+    let mut behind = vec![];
+    for (i, pc) in w.parcels.iter().enumerate() {
+        if !pc.alive || pc.plate != a as u32 { continue; }
+        let side = dot(pc.pos, vhat) + 0.22 * w.weak_noise.eval(pc.pos);
+        if side > 0.0 { ahead.push(i); } else { behind.push(i); }
+    }
+    let (moved, is_ahead) = if ahead.len() <= behind.len() { (ahead, true) } else { (behind, false) };
+    let min_n = (50.0 * w.n_scale).round() as usize;
+    if moved.len() < min_n || moved.len() + min_n > old_n { return false; }
+    let new_id = w.plates.len() as u32;
+    let mut n_cont = 0;
+    for &i in &moved {
+        w.parcels[i].plate = new_id;
+        if w.parcels[i].kind == Kind::Continental { n_cont += 1; }
+    }
+    let om = w.plates[a].omega;
+    let mv = w.plates[a].mean_v;
+    w.plates.push(Plate { omega: om, alive: true, tension: 0.0, n: moved.len(), n_cont, n_weak: 0, mean_v: mv, slab: 0.0, born: t });
+    let parent_rot = w.rot[a];
+    w.rot.push(parent_rot);
+    // Initial separation (thermal uplift / plume push, Rule X) so ridge push can take over: 8 km/Myr
+    // across the rift, shared between the halves in inverse proportion to their size.
+    let dir = if is_ahead { vhat } else { scale(vhat, -1.0) };
+    let kick = scale(cross(c, dir), 8.0 / R_KM);
+    let frac = moved.len() as f64 / old_n as f64;
+    w.plates[new_id as usize].omega = add(om, scale(kick, 1.0 - frac));
+    w.plates[a].omega = sub(om, scale(kick, frac));
+    w.rift_pairs.insert(((a as u32).min(new_id), (a as u32).max(new_id)), t);
+    w.plates[a].tension = 0.0;
+    w.plates[a].n -= moved.len();
+    w.plates[a].n_cont = w.plates[a].n_cont.saturating_sub(n_cont);
+    true
+}
+
+fn resolve(remap: &[u32], mut x: u32) -> u32 {
+    while remap[x as usize] != x { x = remap[x as usize]; }
+    x
+}
+
+fn merge_and_cleanup(w: &mut World) {
+    let s = w.s;
+    let t = w.t;
+    // Boundary census per plate pair: (boundary parcels, continent-continent contacts, sum |v_rel|).
+    let mut pairs: HashMap<(u32, u32), (usize, usize, f64)> = HashMap::new();
+    w.pair_ccf.clear();
+    for (i, pc) in w.parcels.iter().enumerate() {
+        if !pc.alive { continue; }
+        let b = match w.binfo.get(i) { Some(Some(b)) => *b, _ => continue };
+        if b.dist >= 1.5 * s || b.other == pc.plate { continue; }
+        let pj = &w.parcels[b.oidx as usize];
+        if pj.plate != b.other || !pj.alive { continue; }
+        let key = (pc.plate.min(b.other), pc.plate.max(b.other));
+        let e = pairs.entry(key).or_insert((0, 0, 0.0));
+        e.0 += 1;
+        if pc.kind == Kind::Continental && pj.kind == Kind::Continental { e.1 += 1; }
+        let vi = surface_velocity(w.plates[pc.plate as usize].omega, pc.pos);
+        let vj = surface_velocity(w.plates[pj.plate as usize].omega, pj.pos);
+        e.2 += norm(sub(vi, vj));
+    }
+    // Suturing (Rule IV/XI): a collided, mostly continent-continent, nearly static boundary welds the plates.
+    let mut merges: Vec<(u32, u32)> = vec![];
+    let dt = w.p.dt;
+    for (&(a, b), &(nb, ncc, vsum)) in &pairs {
+        let ccf = (ncc as f64) / (nb as f64);
+        w.pair_ccf.insert((a, b), ccf);
+        if (nb as f64) < 10.0 * w.n_scale.sqrt() { continue; }
+        let vrel = vsum / nb as f64;
+        // Track how long this contact has been static: a boundary with no relative motion is not a
+        // boundary (failed rift, locked collision), and the two plates are really one plate.
+        let st = w.static_myr.entry((a, b)).or_insert(0.0);
+        if vrel < 4.0 { *st += dt; } else { *st = 0.0; }
+        let static_long = *st >= 40.0;
+        // A freshly rifted pair gets time to separate before it can be declared a failed rift.
+        if t - w.plates[a as usize].born < 80.0 || t - w.plates[b as usize].born < 80.0 { continue; }
+        // Weld when the contact is a locked, mostly continental collision, or when it has simply stopped
+        // moving for 40 Myr. Active partial collisions are handled locally by block accretion instead.
+        let locked = w.polarity.contains_key(&(a, b)) && ccf > 0.6 && vrel < 20.0;
+        if locked || static_long {
+            if w.plates[a as usize].n <= w.plates[b as usize].n { merges.push((a, b)); } else { merges.push((b, a)); }
+        }
+    }
+    let mut remap: Vec<u32> = (0..w.plates.len() as u32).collect();
+    for (from, into) in merges {
+        let f = resolve(&remap, from);
+        let i = resolve(&remap, into);
+        if f == i { continue; }
+        remap[f as usize] = i;
+        w.plates[f as usize].alive = false;
+        w.stats.merges += 1;
+    }
+    if w.stats.merges > 0 {
+        for i in 0..w.parcels.len() {
+            if !w.parcels[i].alive { continue; }
+            let pl = w.parcels[i].plate;
+            let np = resolve(&remap, pl);
+            if let Some(Some(b)) = w.binfo.get(i) {
+                if b.other != pl && resolve(&remap, b.other) == np && b.dist < 1.5 * s { w.parcels[i].suture_t = t; }
+            }
+            w.parcels[i].plate = np;
+        }
+    }
+    // Plates consumed to almost nothing (ridge subduction, Last Rule) dissolve into their neighbours.
+    let mut counts = vec![0usize; w.plates.len()];
+    for pc in &w.parcels { if pc.alive { counts[pc.plate as usize] += 1; } }
+    let tiny_n = (30.0 * w.n_scale).round() as usize;
+    let tiny: Vec<u32> = (0..w.plates.len()).filter(|&a| w.plates[a].alive && counts[a] < tiny_n).map(|a| a as u32).collect();
+    if !tiny.is_empty() {
+        let mut adopt: Vec<(usize, u32)> = vec![];
+        {
+            let hash = &w.hash;
+            let parcels = &w.parcels;
+            let plates = &w.plates;
+            for (i, pc) in parcels.iter().enumerate() {
+                if !pc.alive || !tiny.contains(&pc.plate) { continue; }
+                let mut best: Option<(u32, f64)> = None;
+                hash.query(pc.pos, 3.0 * s, |k| {
+                    let pk = &parcels[k as usize];
+                    if pk.alive && pk.plate != pc.plate && plates[pk.plate as usize].alive && !tiny.contains(&pk.plate) {
+                        let d = dist(pk.pos, pc.pos);
+                        if best.map_or(true, |(_, bd)| d < bd) { best = Some((pk.plate, d)); }
+                    }
+                });
+                if let Some((pl, _)) = best { adopt.push((i, pl)); }
+            }
+        }
+        for (i, pl) in adopt { w.parcels[i].plate = pl; }
+    }
+    let alive: Vec<bool> = w.plates.iter().map(|p| p.alive).collect();
+    w.polarity.retain(|&(a, b), _| a != b && alive[a as usize] && alive[b as usize]);
+    w.pair_absorbed.retain(|&(a, b), _| a != b && alive[a as usize] && alive[b as usize]);
+    w.static_myr.retain(|&(a, b), _| a != b && alive[a as usize] && alive[b as usize]);
+    let (t_now, push_myr) = (w.t, w.p.rift_push_myr);
+    w.rift_pairs.retain(|&(a, b), &mut tr| a != b && alive[a as usize] && alive[b as usize] && t_now - tr < push_myr + 1.0);
+}
+
+pub fn plate_stats(w: &mut World) {
+    for pl in w.plates.iter_mut() { pl.n = 0; pl.n_cont = 0; pl.n_weak = 0; pl.mean_v = 0.0; }
+    let t = w.t;
+    let (mut total, mut cont) = (0usize, 0usize);
+    let (mut vsum, mut vmax) = (0.0f64, 0.0f64);
+    for pc in &w.parcels {
+        if !pc.alive { continue; }
+        let pl = &mut w.plates[pc.plate as usize];
+        pl.n += 1;
+        total += 1;
+        if pc.kind == Kind::Continental {
+            pl.n_cont += 1;
+            cont += 1;
+            if t - pc.suture_t < 500.0 || t - pc.hot_t < 30.0 { pl.n_weak += 1; }
+        }
+        let v = norm(surface_velocity(pl.omega, pc.pos));
+        pl.mean_v += v;
+        vsum += v;
+        if v > vmax { vmax = v; }
+    }
+    for pl in w.plates.iter_mut() {
+        if pl.n > 0 { pl.mean_v /= pl.n as f64; } else { pl.alive = false; }
+    }
+    w.stats.mean_v = vsum / total.max(1) as f64;
+    w.stats.max_v = vmax;
+    w.stats.cont_frac = cont as f64 / total.max(1) as f64;
+    w.stats.n_plates = w.plates.iter().filter(|p| p.alive).count();
+    w.stats.n_parcels = total;
+}

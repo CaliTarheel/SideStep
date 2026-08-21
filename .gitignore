@@ -1,0 +1,4 @@
+/target
+/out
+# Scotese's "Rules of Thumb" handout is copyrighted; keep it local (see docs/RULES.md for the mapping)
+*.pdf
