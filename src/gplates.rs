@@ -118,7 +118,8 @@ pub fn export(w: &World) {
         let ldir = format!("{}/rasters/{}", dir, layer);
         let _ = std::fs::create_dir_all(&ldir);
         for (t, _) in &w.rot_hist {
-            let src = format!("{}/t{:05}/{}.png", w.p.out, t.round() as i64, layer);
+            let nominal = (t / w.p.slice_every).round() * w.p.slice_every;
+            let src = format!("{}/t{:05}/{}.png", w.p.out, nominal.round() as i64, layer);
             let dst = format!("{}/{}-{}.png", ldir, layer, age(*t).round() as i64);
             let _ = std::fs::copy(src, dst);
         }

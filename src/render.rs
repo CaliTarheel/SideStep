@@ -144,7 +144,9 @@ pub fn render(w: &World) {
         })
         .collect();
 
-    let dir = format!("{}/t{:05}", w.p.out, w.t.round() as i64);
+    // Name slices by nominal time so steps that do not divide the slice interval still give round names.
+    let nominal = (w.t / w.p.slice_every).round() * w.p.slice_every;
+    let dir = format!("{}/t{:05}", w.p.out, nominal.round() as i64);
     std::fs::create_dir_all(&dir).expect("slice dir");
 
     // Elevation: hypsometric PNG + raw little-endian f32.

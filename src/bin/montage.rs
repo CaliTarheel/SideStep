@@ -15,7 +15,7 @@ fn main() {
             let name = e.file_name().to_string_lossy().to_string();
             name.strip_prefix('t').and_then(|n| n.parse::<i64>().ok()).map(|t| (t, e.path().to_string_lossy().to_string()))
         })
-        .filter(|(t, _)| t % every == 0)
+        .filter(|(t, _)| { let r = t % every; r.min(every - r) <= (every / 10).max(1) })
         .collect();
     slices.sort();
     if slices.is_empty() { eprintln!("no slices in {}", dir); std::process::exit(1); }
@@ -32,7 +32,7 @@ fn main() {
         let x = pad + (i as u32 % cols) * (w + pad);
         let y = pad + (i as u32 / cols) * (h + pad + label_h) + label_h;
         imageops::overlay(&mut sheet, &small, x as i64, y as i64);
-        draw_label(&mut sheet, x, y - label_h + 2, &format!("{} MYR", t));
+        draw_label(&mut sheet, x, y - label_h + 2, &format!("{} MYR", ((*t as f64) / every as f64).round() as i64 * every));
     }
     let out = format!("{}/montage_{}.png", dir, layer);
     sheet.save(&out).expect("save montage");
