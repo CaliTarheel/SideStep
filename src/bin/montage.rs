@@ -15,9 +15,19 @@ fn main() {
             let name = e.file_name().to_string_lossy().to_string();
             name.strip_prefix('t').and_then(|n| n.parse::<i64>().ok()).map(|t| (t, e.path().to_string_lossy().to_string()))
         })
-        .filter(|(t, _)| { let r = t % every; r.min(every - r) <= (every / 10).max(1) })
         .collect();
+    // keep, for each multiple of `every`, the slice nearest to it
     slices.sort();
+    let mut picked: Vec<(i64, String)> = vec![];
+    let mut by_mark: std::collections::BTreeMap<i64, (i64, String)> = std::collections::BTreeMap::new();
+    for (t, path) in slices {
+        let mark = ((t as f64) / every as f64).round() as i64 * every;
+        let d = (t - mark).abs();
+        if d > (every / 4).max(1) { continue; }
+        match by_mark.get(&mark) { Some((bt, _)) if (bt - mark).abs() <= d => {}, _ => { by_mark.insert(mark, (t, path)); } }
+    }
+    for (_, v) in by_mark { picked.push(v); }
+    let slices = picked;
     if slices.is_empty() { eprintln!("no slices in {}", dir); std::process::exit(1); }
 
     let first = image::open(format!("{}/{}.png", slices[0].1, layer)).expect("open first slice").to_rgb8();
