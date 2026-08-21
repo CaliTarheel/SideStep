@@ -4,7 +4,7 @@
     {
       "name": "viewer",
       "runtimeExecutable": "./target/release/viewer.exe",
-      "runtimeArgs": ["out/hr360", "8077"],
+      "runtimeArgs": ["out/hr640", "8077"],
       "port": 8077
     }
   ]

@@ -25,7 +25,7 @@ cargo build --release
 ./target/release/tectonic --years 1000 --slice 10 --out out/run1
 ```
 
-Defaults: 40 000 parcels (~113 km spacing), 12 plates, 30 % continental area, 24 hotspots,
+Defaults: 40 000 parcels (~113 km spacing), 12 plates, 30 % continental area, 12 drifting hotspots,
 1 Myr steps, a slice every 10 Myr, 1024×512 equirectangular output. A 1000 Myr run takes
 ~90 s on 12 cores. `--help` lists every physics knob.
 
@@ -86,10 +86,14 @@ less than a spacing per step:
 
 This takes ~15× longer than the 40K default (about 25 minutes for 1000 Myr on 12 cores).
 Three times the default linear resolution (37 km spacing, 360K parcels, 3072-px maps) is
-about 90 minutes:
+about 90 minutes; four times (28 km, 640K parcels, 4096-px maps) about 3-4 hours:
 
 ```bash
 ./target/release/tectonic --parcels 360000 --width 3072 --dt 0.33 --out out/hr360
+```
+
+```bash
+./target/release/tectonic --parcels 640000 --width 4096 --dt 0.25 --out out/hr640
 ```
 
 The physical resolution is the parcel spacing (113 km at 40K, 56 km at 160K), not the pixel
@@ -106,7 +110,6 @@ equator (1024 px ≈ 39 km/px, 2048 px ≈ 20 km/px).
 - `src/render.rs` — history → elevation, rasterisation, PNG / raw writers
 - `src/bin/montage.rs` — contact-sheet tool
 - `src/bin/viewer.rs` + `viewer/index.html` — localhost server + WebGL globe viewer
-
 - `src/gplates.rs` — GPlates export (rotations, GPML, GMT, raster sequences)
 
 ## Status (v0)
@@ -116,9 +119,11 @@ Earth-like speeds (mean 10–35 km/Myr), 11–22 rifts per Gyr, continents stay 
 collision belts form and lock, failed rifts close and fill, hotspot chains and shelves persist.
 Subduction initiates only after compression builds (old passive margins, exhausted shortening
 budget, or next to an existing trench); rifts nucleate at weaknesses and propagate along them
-before splitting a plate; sea level is eustatic. Known gaps: continental area drifts a few
-percent per Gyr, no back-arc basins or rollback, no fracture zones, relief is coarse at the parcel
-scale (needs an amplification stage). See [docs/RULES.md](docs/RULES.md).
+before splitting a plate; old slabs roll back and open back-arc basins behind detached arcs;
+sea level is eustatic; rendered elevation carries tectonically-modulated sub-parcel detail.
+Known gaps: continental area drifts a few percent per Gyr, no fracture zones, arc detachment
+is probabilistic, and the detail layer is noise rather than a process model. See
+[docs/RULES.md](docs/RULES.md).
 
 ## Reference
 

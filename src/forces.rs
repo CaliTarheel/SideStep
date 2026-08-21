@@ -86,7 +86,9 @@ pub fn update_omegas(w: &mut World) {
         ];
         let mut om = solve3(m, torque[a]);
         let v = norm(om) * R_KM;
-        if v > p.v_max { om = scale(om, p.v_max / v); }
+        // A detached arc rolls back at mantle-flow-limited speed, not at the slab-suction limit.
+        let cap = if w.arc_plates.contains_key(&(a as u32)) { p.rollback_v } else { p.v_max };
+        if v > cap { om = scale(om, cap / v); }
         let k = p.omega_relax;
         let pl = &mut w.plates[a];
         pl.omega = add(scale(pl.omega, 1.0 - k), scale(om, k));

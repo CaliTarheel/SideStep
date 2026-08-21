@@ -89,6 +89,7 @@ pub struct Stats {
     pub cont_lost: usize,
     pub cont_grown: usize,
     pub initiations: usize,
+    pub backarcs: usize,
     pub rifts: usize,
     pub merges: usize,
     pub mean_v: f64,
@@ -130,6 +131,18 @@ pub struct Params {
     pub init_short: f64,
     /// A convergent contact this close (km) to an existing trench starts subducting at once ("virus").
     pub virus_km: f64,
+    /// Slab age (Myr) above which the arc can detach and roll back (back-arc opening).
+    pub rollback_age: f64,
+    /// Probability per Myr that an eligible arc detaches.
+    pub rollback_rate: f64,
+    /// Width (km) of the arc sliver that detaches.
+    pub backarc_km: f64,
+    /// Lifetime (Myr) of a detached arc plate before it re-welds (back-arc basins stay small).
+    pub backarc_myr: f64,
+    /// Speed cap (km/Myr) for a rolling-back arc plate.
+    pub rollback_v: f64,
+    /// Add tectonically-modulated sub-parcel detail to the rendered elevation.
+    pub detail: bool,
     pub drag_ocean: f64,
     pub drag_cont: f64,
     /// Phanerozoic speed limit, km/Myr (Rule II: ~20 cm/yr).
@@ -154,7 +167,7 @@ impl Params {
         Params {
             seed: 42, n_parcels: 40_000, n_plates: 12, years: 1000.0, dt: 1.0, slice_every: 10.0,
             width: 1024, out: "out/run".into(), cont_frac: 0.30, n_hotspots: 12,
-            k_slab: 0.015, k_ridge: 0.004, k_coll: 0.2, k_suction: 0.003, k_rift: 0.012, rift_push_myr: 60.0, rift_prop_v: 150.0, k_resist: 0.05, init_age: 60.0, init_short: 150.0, virus_km: 600.0, drag_ocean: 1.0, drag_cont: 3.0,
+            k_slab: 0.015, k_ridge: 0.004, k_coll: 0.2, k_suction: 0.003, k_rift: 0.012, rift_push_myr: 60.0, rift_prop_v: 150.0, k_resist: 0.05, init_age: 60.0, init_short: 150.0, virus_km: 600.0, rollback_age: 80.0, rollback_rate: 0.012, backarc_km: 300.0, backarc_myr: 40.0, rollback_v: 30.0, detail: true, drag_ocean: 1.0, drag_cont: 3.0,
             v_max: 200.0, omega_relax: 0.5,
             rift_threshold: 1.0, rift_rate: 0.05,
             arc_rate: 0.04, hot_rate: 2.0, erosion_tau: 40.0, volc_tau: 60.0,
@@ -197,6 +210,12 @@ impl Params {
                 "init-age" => p.init_age = f(),
                 "init-short" => p.init_short = f(),
                 "virus-km" => p.virus_km = f(),
+                "rollback-age" => p.rollback_age = f(),
+                "rollback-rate" => p.rollback_rate = f(),
+                "backarc-km" => p.backarc_km = f(),
+                "backarc-myr" => p.backarc_myr = f(),
+                "rollback-v" => p.rollback_v = f(),
+                "detail" => p.detail = val != "0" && val != "false",
                 "drag-ocean" => p.drag_ocean = f(),
                 "drag-cont" => p.drag_cont = f(),
                 "v-max" => p.v_max = f(),
@@ -238,7 +257,8 @@ const HELP: &str = "tectonic - time-evolved spherical plate tectonics (Scotese r
   --cont-frac F       initial continental area fraction (0.30)
   --hotspots N        fixed mantle plumes (24)
   physics: --k-slab --k-ridge --k-coll --k-suction --k-rift --rift-push-myr --rift-prop-v
-           --k-resist --init-age --init-short --virus-km --drag-ocean --drag-cont --v-max --omega-relax
+           --k-resist --init-age --init-short --virus-km --rollback-age --rollback-rate
+           --backarc-km --backarc-myr --rollback-v --detail 0|1 --drag-ocean --drag-cont --v-max --omega-relax
            --rift-threshold --rift-rate --arc-rate --hot-rate --erosion-tau --volc-tau
            --thick-coeff --thin-coeff --accrete-rate";
 
@@ -274,6 +294,12 @@ pub struct World {
     pub pair_compress: HashMap<(u32, u32), f64>,
     /// Rifts currently propagating.
     pub rifts: Vec<ActiveRift>,
+    /// Detached arc plates: arc plate -> (parent upper plate, lower plate, detachment time).
+    pub arc_plates: HashMap<u32, (u32, u32, f64)>,
+    /// Slow drift of each plume (rad/Myr tangent vector), Rule X: "some aren't fixed".
+    pub hot_drift: Vec<V3>,
+    /// Sub-parcel detail noise octaves for rendering (wavelengths ~1000, 300, 100 km).
+    pub detail_noise: Vec<Noise>,
     /// Ocean volume at t = 0 (mean water column per parcel, m) and the current eustatic sea level (m).
     pub sea_v0: Option<f64>,
     pub sea_level: f64,
@@ -345,8 +371,16 @@ impl World {
             let v = rng.gen_range(10.0..40.0);
             Plate { omega: scale(axis, v / R_KM), alive: true, tension: 0.0, n: 0, n_cont: 0, n_weak: 0, mean_v: v, slab: 0.0, suction: 0.0, born: 0.0 }
         }).collect();
-        let hotspots = (0..p.n_hotspots).map(|_| random_unit(&mut rng)).collect();
+        // Plumes: keep them off the poles (equirectangular maps smear a polar island into a band)
+        // and give each a slow random drift of ~2 km/Myr.
+        let mut hotspots: Vec<V3> = vec![];
+        while hotspots.len() < p.n_hotspots {
+            let h = random_unit(&mut rng);
+            if h[1].abs() < 0.94 { hotspots.push(h); }
+        }
+        let hot_drift: Vec<V3> = hotspots.iter().map(|&h| { let d = normalize(cross(h, random_unit(&mut rng))); scale(d, 2.0 / R_KM) }).collect();
         let weak_noise = Noise::new(&mut rng, 8, 6.0, 18.0);
+        let detail_noise = vec![Noise::new(&mut rng, 10, 15.0, 40.0), Noise::new(&mut rng, 12, 60.0, 150.0), Noise::new(&mut rng, 14, 250.0, 500.0)];
 
         let n_scale = n as f64 / 40_000.0;
         let rows_lock = ((25.0 * 113.0) / (s * R_KM)).round().max(3.0) as u32;
@@ -354,7 +388,7 @@ impl World {
         let mut w = World {
             hash: SpatialHash::new(1.5 * s), p, t: 0.0, s, n_scale, rows_lock,
             rot: vec![IDENT; n_plates], rot_hist: vec![], parcels, plates, grid, hotspots,
-            polarity: HashMap::new(), pair_absorbed: HashMap::new(), pair_ccf: HashMap::new(), rift_pairs: HashMap::new(), static_myr: HashMap::new(), pair_compress: HashMap::new(), rifts: vec![], sea_v0: None, sea_level: 0.0, rng, binfo: vec![], stats: Stats::default(), weak_noise,
+            polarity: HashMap::new(), pair_absorbed: HashMap::new(), pair_ccf: HashMap::new(), rift_pairs: HashMap::new(), static_myr: HashMap::new(), pair_compress: HashMap::new(), rifts: vec![], arc_plates: HashMap::new(), hot_drift, detail_noise, sea_v0: None, sea_level: 0.0, rng, binfo: vec![], stats: Stats::default(), weak_noise,
         };
         w.rebuild_hash();
         crate::step::plate_stats(&mut w);

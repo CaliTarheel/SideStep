@@ -33,6 +33,8 @@ pub fn step(w: &mut World) {
     crate::forces::update_omegas(w);
     // 7. Continental rifting.
     rifting(w);
+    // 7b. Arc detachment / slab rollback / back-arc basins.
+    backarc(w);
     // 8. Suturing and removal of consumed plates.
     merge_and_cleanup(w);
     plate_stats(w);
@@ -349,6 +351,7 @@ fn relax(w: &mut World) {
     let s = w.s;
     let r_hot = w.reach(0.8, 90.0);
     let p = w.p.clone();
+    for (h, d) in w.hotspots.iter_mut().zip(w.hot_drift.iter()) { *h = normalize(add(*h, scale(*d, dt))); }
     let hs = w.hotspots.clone();
     // Erosion as diffusion of crustal thickness between neighbouring continental parcels
     // (volume-conserving: mountains shed into their forelands and shelves), plus a slow loss term.
@@ -650,10 +653,23 @@ fn split_along(w: &mut World, r: &ActiveRift) -> bool {
     let s = w.s;
     let t = w.t;
     let mut path = r.path.clone();
+    // this plate's current boundary parcels: the extension through the ocean steers toward the nearest
+    // one, so the cut takes the shortest plausible route to an existing boundary (a transform link)
+    let bnd: Vec<V3> = w.parcels.iter().enumerate()
+        .filter(|(i, pc)| pc.alive && pc.plate == a as u32 && matches!(w.binfo.get(*i), Some(Some(b)) if b.dist < 1.5 * s))
+        .map(|(_, pc)| pc.pos).collect();
     for e in 0..2 {
         let mut p = r.tip[e];
         let mut d = r.dir[e];
         for _ in 0..600 {
+            if !bnd.is_empty() {
+                let mut best = (f64::MAX, bnd[0]);
+                for &q in &bnd { let dq = dist(q, p); if dq < best.0 { best = (dq, q); } }
+                if best.0 > 1.5 * s {
+                    let tb = tangent_toward(p, best.1);
+                    d = normalize(add(scale(d, 0.75), scale(tb, 0.25)));
+                }
+            }
             p = move_along(p, d, 0.8 * s);
             d = normalize(sub(d, scale(p, dot(d, p))));
             let mut on_plate = false;
@@ -735,6 +751,82 @@ fn split_along(w: &mut World, r: &ActiveRift) -> bool {
     w.plates[a].n = old_n.saturating_sub(moved.len());
     w.plates[a].n_cont = w.plates[a].n_cont.saturating_sub(n_cont);
     true
+}
+
+/// Arc detachment and slab rollback (Rules VII-IX). Where an old, dense slab subducts, the arc can
+/// detach from its upper plate as a small plate of its own; slab suction then rolls it trenchward at a
+/// mantle-limited speed and a back-arc basin of new crust opens behind it. Back-arc basins stay small
+/// (Rule VIII): the arc plate re-welds to its parent after `backarc_myr`, or when the slab gets young.
+fn backarc(w: &mut World) {
+    let t = w.t;
+    let dt = w.p.dt;
+    let s = w.s;
+    // 1. retire arc plates
+    let mut retire: Vec<(u32, u32)> = vec![];
+    for (&arc, &(parent, _lower, born)) in &w.arc_plates {
+        if !w.plates[arc as usize].alive { retire.push((arc, u32::MAX)); continue; }
+        if t - born > w.p.backarc_myr || !w.plates[parent as usize].alive { retire.push((arc, parent)); }
+    }
+    for (arc, parent) in retire {
+        w.arc_plates.remove(&arc);
+        if parent == u32::MAX || !w.plates[parent as usize].alive || !w.plates[arc as usize].alive { continue; }
+        for pc in w.parcels.iter_mut() { if pc.alive && pc.plate == arc { pc.plate = parent; } }
+        w.plates[arc as usize].alive = false;
+        w.stats.merges += 1;
+    }
+    // 2. candidate trenches: per (lower, upper) pair, contact parcels on the lower plate and mean slab age
+    let mut pairs: HashMap<(u32, u32), (Vec<V3>, f64)> = HashMap::new();
+    for (i, pc) in w.parcels.iter().enumerate() {
+        if !pc.alive || pc.kind != Kind::Oceanic { continue; }
+        let Some(Some(b)) = w.binfo.get(i) else { continue };
+        if b.conv <= CONV_EPS || b.dist >= 1.5 * s { continue; }
+        let key = (pc.plate.min(b.other), pc.plate.max(b.other));
+        match w.polarity.get(&key) { Some(&sp) if sp == pc.plate => {}, _ => continue }
+        let e = pairs.entry((pc.plate, b.other)).or_insert((vec![], 0.0));
+        e.0.push(pc.pos);
+        e.1 += t - pc.birth;
+    }
+    let min_contact = (20.0 * w.n_scale.sqrt()).round() as usize;
+    let min_n = (40.0 * w.n_scale).round() as usize;
+    let r_arc = w.km(w.p.backarc_km);
+    let mut cands: Vec<((u32, u32), Vec<V3>)> = vec![];
+    for ((lower, upper), (pts, age_sum)) in pairs {
+        if pts.len() < min_contact { continue; }
+        if age_sum / (pts.len() as f64) < w.p.rollback_age { continue; }
+        if w.arc_plates.contains_key(&upper) { continue; }
+        if w.arc_plates.values().any(|&(par, low, _)| par == upper && low == lower) { continue; }
+        if !w.plates[upper as usize].alive { continue; }
+        if w.rng.gen::<f64>() >= w.p.rollback_rate * dt { continue; }
+        cands.push(((lower, upper), pts));
+    }
+    for ((lower, upper), pts) in cands {
+        // the arc sliver: upper-plate parcels within backarc_km of the trench contact
+        let mut set: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for &q in &pts {
+            w.hash.query(q, r_arc, |k| {
+                let pk = &w.parcels[k as usize];
+                if pk.alive && pk.plate == upper && dist(pk.pos, q) < r_arc { set.insert(k as usize); }
+            });
+        }
+        let upper_n = w.plates[upper as usize].n.max(1);
+        if set.len() < min_n || set.len() * 2 > upper_n { continue; }
+        let new_id = w.plates.len() as u32;
+        let mut n_cont = 0;
+        for &i in &set {
+            w.parcels[i].plate = new_id;
+            if w.parcels[i].kind == Kind::Continental { n_cont += 1; }
+        }
+        let om = w.plates[upper as usize].omega;
+        let mv = w.plates[upper as usize].mean_v;
+        w.plates.push(Plate { omega: om, alive: true, tension: 0.0, n: set.len(), n_cont, n_weak: 0, mean_v: mv, slab: 0.0, suction: 0.0, born: t });
+        let parent_rot = w.rot[upper as usize];
+        w.rot.push(parent_rot);
+        w.polarity.insert((lower.min(new_id), lower.max(new_id)), lower);
+        w.rift_pairs.insert((upper.min(new_id), upper.max(new_id)), t);
+        w.arc_plates.insert(new_id, (upper, lower, t));
+        w.plates[upper as usize].n = upper_n.saturating_sub(set.len());
+        w.stats.backarcs += 1;
+    }
 }
 
 fn resolve(remap: &[u32], mut x: u32) -> u32 {
@@ -834,6 +926,7 @@ fn merge_and_cleanup(w: &mut World) {
     w.polarity.retain(|&(a, b), _| a != b && alive[a as usize] && alive[b as usize]);
     w.pair_absorbed.retain(|&(a, b), _| a != b && alive[a as usize] && alive[b as usize]);
     w.pair_compress.retain(|&(a, b), _| a != b && alive[a as usize] && alive[b as usize]);
+    w.arc_plates.retain(|&arc, &mut (par, low, _)| alive[arc as usize] && alive[par as usize] && alive[low as usize]);
     w.static_myr.retain(|&(a, b), _| a != b && alive[a as usize] && alive[b as usize]);
     let (t_now, push_myr) = (w.t, w.p.rift_push_myr);
     w.rift_pairs.retain(|&(a, b), &mut tr| a != b && alive[a as usize] && alive[b as usize] && t_now - tr < push_myr + 1.0);

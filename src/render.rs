@@ -138,7 +138,21 @@ pub fn render(w: &World) {
                     // Boundary class from the nearest parcel; prefer a classified neighbour if the nearest has none.
                     let mut cls = classify(w, bi as usize);
                     if cls == 0 && best.1 != bi { cls = classify(w, best.1 as usize); }
-                    Px { elev: (esum / wsum) as f32, plate: pc.plate, kind: if pc.kind == Kind::Continental { 1 } else { 0 }, age, cls }
+                    let mut elev = esum / wsum;
+                    if w.p.detail {
+                        // Sub-parcel detail conditioned on tectonic state: abyssal hills on young sea floor,
+                        // rugged relief in young orogens and arcs, smooth cratons, shelves and abyssal plains.
+                        let n = 0.55 * w.detail_noise[0].eval(p) + 0.3 * w.detail_noise[1].eval(p) + 0.15 * w.detail_noise[2].eval(p);
+                        let amp = if pc.kind == Kind::Oceanic {
+                            let a = (w.t - pc.birth).max(0.0);
+                            25.0 + 160.0 * (-a / 50.0).exp()
+                        } else if elev > 0.0 {
+                            let young = (w.t - pc.suture_t < 150.0) || (w.t - pc.arc_t < 20.0) || pc.thick > 40.0;
+                            40.0 + 0.12 * elev + if young { 120.0 } else { 0.0 }
+                        } else { 12.0 };
+                        elev += amp * n;
+                    }
+                    Px { elev: elev as f32, plate: pc.plate, kind: if pc.kind == Kind::Continental { 1 } else { 0 }, age, cls }
                 })
                 .collect()
         })
