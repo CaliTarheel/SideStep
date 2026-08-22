@@ -96,6 +96,14 @@ about 90 minutes; four times (28 km, 640K parcels, 4096-px maps) about 3-4 hours
 ./target/release/tectonic --parcels 640000 --width 4096 --dt 0.25 --out out/hr640
 ```
 
+Before trusting a rule change, check that event rates do not depend on the step or the parcel
+count — run a couple of seeds at `--dt 1` and `--dt 0.25` and compare rifts / initiations /
+back-arcs / mean speed in `log.csv` (they should agree to within seed-to-seed scatter):
+
+```bash
+for sd in 3 7; do for dt in 1 0.25; do ./target/release/tectonic --seed $sd --dt $dt --slice 50 --out out/sweep_s${sd}_dt${dt}; done; done
+```
+
 The physical resolution is the parcel spacing (113 km at 40K, 56 km at 160K), not the pixel
 count: the renderer samples each pixel with a Gaussian of half a spacing, so features smaller
 than ~2 spacings do not exist. Pick the map width so there are 2–3 pixels per parcel at the

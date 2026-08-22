@@ -129,6 +129,8 @@ pub struct Params {
     pub init_age: f64,
     /// Accumulated shortening (km) that forces subduction to start regardless of age.
     pub init_short: f64,
+    /// Continental shortening (km) after which a collision belt locks and the trench jumps.
+    pub lock_km: f64,
     /// A convergent contact this close (km) to an existing trench starts subducting at once ("virus").
     pub virus_km: f64,
     /// Slab age (Myr) above which the arc can detach and roll back (back-arc opening).
@@ -167,7 +169,7 @@ impl Params {
         Params {
             seed: 42, n_parcels: 40_000, n_plates: 12, years: 1000.0, dt: 1.0, slice_every: 10.0,
             width: 1024, out: "out/run".into(), cont_frac: 0.30, n_hotspots: 12,
-            k_slab: 0.015, k_ridge: 0.004, k_coll: 0.2, k_suction: 0.003, k_rift: 0.012, rift_push_myr: 60.0, rift_prop_v: 150.0, k_resist: 0.05, init_age: 60.0, init_short: 150.0, virus_km: 600.0, rollback_age: 80.0, rollback_rate: 0.012, backarc_km: 300.0, backarc_myr: 40.0, rollback_v: 30.0, detail: true, drag_ocean: 1.0, drag_cont: 3.0,
+            k_slab: 0.015, k_ridge: 0.004, k_coll: 0.2, k_suction: 0.003, k_rift: 0.012, rift_push_myr: 60.0, rift_prop_v: 150.0, k_resist: 0.05, init_age: 60.0, init_short: 150.0, lock_km: 500.0, virus_km: 600.0, rollback_age: 80.0, rollback_rate: 0.012, backarc_km: 300.0, backarc_myr: 40.0, rollback_v: 30.0, detail: true, drag_ocean: 1.0, drag_cont: 3.0,
             v_max: 200.0, omega_relax: 0.5,
             rift_threshold: 1.0, rift_rate: 0.05,
             arc_rate: 0.04, hot_rate: 2.0, erosion_tau: 40.0, volc_tau: 60.0,
@@ -209,6 +211,7 @@ impl Params {
                 "k-resist" => p.k_resist = f(),
                 "init-age" => p.init_age = f(),
                 "init-short" => p.init_short = f(),
+                "lock-km" => p.lock_km = f(),
                 "virus-km" => p.virus_km = f(),
                 "rollback-age" => p.rollback_age = f(),
                 "rollback-rate" => p.rollback_rate = f(),
@@ -269,8 +272,8 @@ pub struct World {
     pub s: f64,
     /// Parcel-count scale relative to the 40 000-parcel reference (count thresholds scale with this).
     pub n_scale: f64,
-    /// Number of parcel rows equal to the reference 25 rows x 113 km of collisional shortening.
-    pub rows_lock: u32,
+    /// Continent-continent contact parcels per plate pair (from the last census), for shortening bookkeeping.
+    pub pair_ncc: HashMap<(u32, u32), usize>,
     /// Cumulative finite rotation of each plate since t = 0 (absolute / hotspot frame).
     pub rot: Vec<[[f64; 3]; 3]>,
     /// Rotation samples at slice times: (t, per-plate rotation if alive).
@@ -282,8 +285,8 @@ pub struct World {
     pub hotspots: Vec<V3>,
     /// For each plate pair (min,max): which plate subducts. Fixed once established (Rule IV).
     pub polarity: HashMap<(u32, u32), u32>,
-    /// Continental parcels absorbed (shortening) per plate pair since contact.
-    pub pair_absorbed: HashMap<(u32, u32), u32>,
+    /// Collisional shortening (km, averaged along the contact) per plate pair since contact.
+    pub pair_absorbed: HashMap<(u32, u32), f64>,
     /// Fraction of each plate pair's contact that is continent-continent (from the last census).
     pub pair_ccf: HashMap<(u32, u32), f64>,
     /// Plate pairs created by a rift, with the rift time: the young rift is pushed apart for `rift_push_myr`.
@@ -383,10 +386,9 @@ impl World {
         let detail_noise = vec![Noise::new(&mut rng, 10, 15.0, 40.0), Noise::new(&mut rng, 12, 60.0, 150.0), Noise::new(&mut rng, 14, 250.0, 500.0)];
 
         let n_scale = n as f64 / 40_000.0;
-        let rows_lock = ((25.0 * 113.0) / (s * R_KM)).round().max(3.0) as u32;
         let n_plates = p.n_plates;
         let mut w = World {
-            hash: SpatialHash::new(1.5 * s), p, t: 0.0, s, n_scale, rows_lock,
+            hash: SpatialHash::new(1.5 * s), p, t: 0.0, s, n_scale, pair_ncc: HashMap::new(),
             rot: vec![IDENT; n_plates], rot_hist: vec![], parcels, plates, grid, hotspots,
             polarity: HashMap::new(), pair_absorbed: HashMap::new(), pair_ccf: HashMap::new(), rift_pairs: HashMap::new(), static_myr: HashMap::new(), pair_compress: HashMap::new(), rifts: vec![], arc_plates: HashMap::new(), hot_drift, detail_noise, sea_v0: None, sea_level: 0.0, rng, binfo: vec![], stats: Stats::default(), weak_noise,
         };

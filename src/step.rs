@@ -141,7 +141,9 @@ fn interact(w: &mut World) {
                     let parcels = &w.parcels;
                     trench_hash.query(pi.pos, r_virus, |k| { if !virus && dist(parcels[k as usize].pos, pi.pos) < r_virus { virus = true; } });
                 }
-                let start = cc || virus || b.dist < r_deep || (old_enough && shortened >= 20.0) || shortened >= w.p.init_short;
+                // (no "deep overlap" trigger: a parcel can only jump that deep in one large step, which made
+                //  initiation depend on dt; accumulated shortening measures the same thing step-independently)
+                let start = cc || virus || (old_enough && shortened >= 20.0) || shortened >= w.p.init_short;
                 if !start { continue; }
                 w.polarity.insert(key, lower);
                 w.pair_compress.remove(&key);
@@ -169,7 +171,7 @@ fn interact(w: &mut World) {
         } else if b.conv <= CONV_EPS {
             // Continental crust grinding along a transform / near-static contact: nothing is consumed.
             continue;
-        } else if pj.kind == Kind::Continental && w.pair_absorbed.get(&key).copied().unwrap_or(0) >= w.rows_lock {
+        } else if pj.kind == Kind::Continental && w.pair_absorbed.get(&key).copied().unwrap_or(0.0) >= w.p.lock_km {
             // The collision belt has locked up after enough shortening. The whole connected continental
             // block of the lower plate is accreted to the upper plate in one event and the boundary
             // re-forms behind it (Rule IV: the trench jumps over the colliding terrane).
@@ -197,7 +199,9 @@ fn interact(w: &mut World) {
             let wsum: f64 = near.iter().map(|x| x.1).sum::<f64>().max(1e-9);
             for (k, wk) in &near { thick_add.push((*k, pi.thick * wk / wsum)); sutures.push(*k); }
             absorbed.push(i);
-            *w.pair_absorbed.entry(key).or_insert(0) += 1;
+            // one parcel of area s^2 removed along a front of ncc parcels = s/ncc of shortening
+            let ncc = w.pair_ncc.get(&key).copied().unwrap_or(8).max(1) as f64;
+            *w.pair_absorbed.entry(key).or_insert(0.0) += s * R_KM / ncc;
         } else if pi.thick < 33.0 && !attached_to_continent(w, i) {
             // Thin, isolated continental slivers (old arcs, stretched shelf) go down with the slab at
             // intra-oceanic trenches - island arcs do not ride across oceans (Rule VIII).
@@ -605,8 +609,10 @@ fn advance_rifts(w: &mut World) {
             let dir = w.rifts[i].dir[e];
             let side = normalize(cross(tip, dir));
             let mut best: Option<(f64, V3, V3)> = None;
+            // turning is limited per kilometre, not per step: +-60 degrees over 150 km
+            let max_turn = 60f64.to_radians() * (step * R_KM / 150.0).min(1.0);
             for k in -4i32..=4 {
-                let ang = k as f64 * 15f64.to_radians();
+                let ang = k as f64 / 4.0 * max_turn;
                 let d = normalize(add(scale(dir, ang.cos()), scale(side, ang.sin())));
                 let np = move_along(tip, d, step);
                 let nd = normalize(sub(d, scale(np, dot(d, np))));
@@ -614,8 +620,8 @@ fn advance_rifts(w: &mut World) {
                 let v = surface_velocity(w.plates[plate].omega, np);
                 let vn = norm(v);
                 let vh = if vn > 1e-6 { scale(v, 1.0 / vn) } else { w.rifts[i].normal };
-                let jitter = 0.3 * w.rng.gen::<f64>();
-                let score = 2.0 * ang.cos() + weak - dot(nd, vh).abs() + jitter;
+                let jitter = 0.3 * dt.sqrt() * w.rng.gen::<f64>();
+                let score = 2.0 * (ang / max_turn.max(1e-9) * 60f64.to_radians()).cos() + weak - dot(nd, vh).abs() + jitter;
                 if best.map_or(true, |(bs, _, _)| score > bs) { best = Some((score, np, nd)); }
             }
             let (_, np, nd) = best.unwrap();
@@ -840,6 +846,7 @@ fn merge_and_cleanup(w: &mut World) {
     // Boundary census per plate pair: (boundary parcels, continent-continent contacts, sum |v_rel|).
     let mut pairs: HashMap<(u32, u32), (usize, usize, f64)> = HashMap::new();
     w.pair_ccf.clear();
+    w.pair_ncc.clear();
     for (i, pc) in w.parcels.iter().enumerate() {
         if !pc.alive { continue; }
         let b = match w.binfo.get(i) { Some(Some(b)) => *b, _ => continue };
@@ -860,6 +867,7 @@ fn merge_and_cleanup(w: &mut World) {
     for (&(a, b), &(nb, ncc, vsum)) in &pairs {
         let ccf = (ncc as f64) / (nb as f64);
         w.pair_ccf.insert((a, b), ccf);
+        w.pair_ncc.insert((a, b), ncc);
         if (nb as f64) < 10.0 * w.n_scale.sqrt() { continue; }
         let vrel = vsum / nb as f64;
         // Track how long this contact has been static: a boundary with no relative motion is not a

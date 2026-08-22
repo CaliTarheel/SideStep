@@ -89,7 +89,8 @@ pub fn update_omegas(w: &mut World) {
         // A detached arc rolls back at mantle-flow-limited speed, not at the slab-suction limit.
         let cap = if w.arc_plates.contains_key(&(a as u32)) { p.rollback_v } else { p.v_max };
         if v > cap { om = scale(om, cap / v); }
-        let k = p.omega_relax;
+        // relaxation toward the quasi-static balance, expressed per Myr so the step size does not matter
+        let k = 1.0 - (1.0 - p.omega_relax).powf(p.dt);
         let pl = &mut w.plates[a];
         pl.omega = add(scale(pl.omega, 1.0 - k), scale(om, k));
         pl.slab = slab[a];
