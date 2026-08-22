@@ -23,7 +23,7 @@ deliberately not yet) in the engine as of v0. File references are to `src/`.
 
 Two rules added after the 160K-parcel run showed deep slots criss-crossing continents:
 
-- **Static contacts close.** A plate pair whose contact has had < 4 km/Myr relative motion for 40 Myr (and is older than the 80 Myr rift refractory) is welded: no strain, no boundary. This is how a failed rift stops being a plate boundary.
+- **Static contacts close.** A plate pair whose contact has accumulated 40 Myr of < 4 km/Myr relative motion (leaky: faster motion decays the count at twice the rate; and the pair is older than the 80 Myr rift refractory) is welded: no strain, no boundary. This is how a failed rift stops being a plate boundary.
 - **Enclosed ocean floor fills.** An intraplate oceanic parcel older than 15 Myr that is enclosed by continental crust of its own plate (≥ 4 continental neighbours on opposing sides — short resultant of the neighbour directions — and at least half of all neighbours) becomes 28 km continental crust: a sediment-filled basin ~900 m below sea level that then thickens by diffusion. The "opposing sides" test matters: with plain adjacency the rule converted every passive margin one row per step and ate the oceans.
 
 ## Crust budget (not in the PDF, needed for a 1 Gyr run)
@@ -56,7 +56,9 @@ Two rules added after the 160K-parcel run showed deep slots criss-crossing conti
 
 ## Time-step and resolution independence
 
-Every rate is per Myr and every length is in km or scaled by parcel count, so `--dt` and `--parcels` are free choices. Things that had to be fixed to get there (each showed up as a 2× change in event rates between `dt 1` and `dt 0.25`, or between 40K and 640K parcels): velocity relaxation is `1 − (1 − omega_relax)^dt`; rift tips may turn at most 60° per 150 km of propagation, not per step; collision lock-up is measured in km of shortening along the contact, not in absorbed parcels; and the deep-overlap subduction trigger was removed. Check convergence with the seed × dt sweep in the README before trusting a new rule.
+Every rate is per Myr and every length is in km or scaled by parcel count, so `--dt` and `--parcels` are free choices. Things that had to be fixed to get there (each showed up as a 2× change in event rates between `dt 1` and `dt 0.25`, or between 40K and 640K parcels): velocity relaxation is `1 − (1 − omega_relax)^dt`; rift tips may turn at most 60° per 150 km of propagation, not per step; collision lock-up is measured in km of shortening along the contact, not in absorbed parcels; and the deep-overlap subduction trigger was removed. Boundary forces (slab pull, suction, ridge push, resistance) act on every parcel within 3 spacings of the other plate, with the per-parcel force normalised to that band's ~2.2-row occupancy; the original 1.5-spacing band flickered between 0 and 1 rows depending on how far a row moved that step, which made plate speeds depend on `v·dt/s`. The static-contact weld counter is a leaky integrator (decays when motion exceeds the threshold) rather than reset-on-exceedance, which depended on how often it was sampled. Check convergence with the seed × dt sweep in the README before trusting a new rule.
+
+Runs are **reproducible**: the same seed and parameters give identical logs. Any loop that consumes the RNG or mutates plate state must iterate in a sorted order — Rust's `HashMap` iteration order differs per process, and iterating it directly (as the back-arc and weld loops once did) made runs differ between launches.
 
 ## Known gaps to revisit
 

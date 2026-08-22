@@ -520,7 +520,7 @@ fn rifting(w: &mut World) {
         // suction toward the trenches it overrides (Rule V). A stagnant plate still creeps toward failure.
         let pulled = (0.35 + (pl.slab + pl.suction) / pull_ref).clamp(0.35, 2.5);
         let size = (pl.n_cont as f64 / (1500.0 * w.n_scale)).sqrt().clamp(0.5, 2.0);
-        let rate = pulled * size * (0.4 + 0.6 * cf) / 320.0;
+        let rate = pulled * size * (0.4 + 0.6 * cf) / 400.0;
         w.plates[a].tension += rate * dt;
         // Sutures and hot spots weaken the lithosphere (Rules X, XI).
         let weak = pl.n_weak as f64 / pl.n_cont.max(1) as f64;
@@ -684,6 +684,19 @@ fn split_along(w: &mut World, r: &ActiveRift) -> bool {
             path.push(p);
         }
     }
+    // Resample the path at <= 0.6 spacing so the barrier is gap-free regardless of the time step
+    // (path points are rift_prop_v * dt apart, which can exceed the barrier radius).
+    let mut dense: Vec<V3> = vec![];
+    for k in 0..path.len() {
+        dense.push(path[k]);
+        if k + 1 < path.len() {
+            let (p0, p1) = (path[k], path[k + 1]);
+            let ang = angle(p0, p1);
+            let n = (ang / (0.6 * s)).ceil() as usize;
+            for j in 1..n { let f = j as f64 / n as f64; dense.push(normalize(add(scale(p0, 1.0 - f), scale(p1, f)))); }
+        }
+    }
+    let path = dense;
     let mut barrier: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for &p in &path {
         w.hash.query(p, 0.9 * s, |k| { let pk = &w.parcels[k as usize]; if pk.alive && pk.plate == a as u32 && dist(pk.pos, p) < 0.9 * s { barrier.insert(k as usize); } });
@@ -769,7 +782,9 @@ fn backarc(w: &mut World) {
     let s = w.s;
     // 1. retire arc plates
     let mut retire: Vec<(u32, u32)> = vec![];
-    for (&arc, &(parent, _lower, born)) in &w.arc_plates {
+    let mut arcs: Vec<(u32, (u32, u32, f64))> = w.arc_plates.iter().map(|(&k, &v)| (k, v)).collect();
+    arcs.sort_by(|x, y| x.0.cmp(&y.0));
+    for (arc, (parent, _lower, born)) in arcs {
         if !w.plates[arc as usize].alive { retire.push((arc, u32::MAX)); continue; }
         if t - born > w.p.backarc_myr || !w.plates[parent as usize].alive { retire.push((arc, parent)); }
     }
@@ -779,6 +794,7 @@ fn backarc(w: &mut World) {
         for pc in w.parcels.iter_mut() { if pc.alive && pc.plate == arc { pc.plate = parent; } }
         w.plates[arc as usize].alive = false;
         w.stats.merges += 1;
+        w.stats.retired += 1;
     }
     // 2. candidate trenches: per (lower, upper) pair, contact parcels on the lower plate and mean slab age
     let mut pairs: HashMap<(u32, u32), (Vec<V3>, f64)> = HashMap::new();
@@ -796,7 +812,11 @@ fn backarc(w: &mut World) {
     let min_n = (40.0 * w.n_scale).round() as usize;
     let r_arc = w.km(w.p.backarc_km);
     let mut cands: Vec<((u32, u32), Vec<V3>)> = vec![];
-    for ((lower, upper), (pts, age_sum)) in pairs {
+    let mut keys: Vec<(u32, u32)> = pairs.keys().copied().collect();
+    keys.sort_unstable();
+    for key in keys {
+        let (pts, age_sum) = pairs.remove(&key).unwrap();
+        let (lower, upper) = key;
         if pts.len() < min_contact { continue; }
         if age_sum / (pts.len() as f64) < w.p.rollback_age { continue; }
         if w.arc_plates.contains_key(&upper) { continue; }
@@ -864,7 +884,10 @@ fn merge_and_cleanup(w: &mut World) {
     // Suturing (Rule IV/XI): a collided, mostly continent-continent, nearly static boundary welds the plates.
     let mut merges: Vec<(u32, u32)> = vec![];
     let dt = w.p.dt;
-    for (&(a, b), &(nb, ncc, vsum)) in &pairs {
+    let mut keys: Vec<(u32, u32)> = pairs.keys().copied().collect();
+    keys.sort_unstable();
+    for &(a, b) in &keys {
+        let (nb, ncc, vsum) = pairs[&(a, b)];
         let ccf = (ncc as f64) / (nb as f64);
         w.pair_ccf.insert((a, b), ccf);
         w.pair_ncc.insert((a, b), ncc);
@@ -872,8 +895,9 @@ fn merge_and_cleanup(w: &mut World) {
         let vrel = vsum / nb as f64;
         // Track how long this contact has been static: a boundary with no relative motion is not a
         // boundary (failed rift, locked collision), and the two plates are really one plate.
+        // leaky integrator (not reset-on-exceedance, which would depend on how often it is sampled)
         let st = w.static_myr.entry((a, b)).or_insert(0.0);
-        if vrel < 4.0 { *st += dt; } else { *st = 0.0; }
+        if vrel < 4.0 { *st += dt; } else { *st = (*st - 2.0 * dt).max(0.0); }
         let static_long = *st >= 40.0;
         // A freshly rifted pair gets time to separate before it can be declared a failed rift.
         if t - w.plates[a as usize].born < 80.0 || t - w.plates[b as usize].born < 80.0 { continue; }
@@ -881,6 +905,7 @@ fn merge_and_cleanup(w: &mut World) {
         // moving for 40 Myr. Active partial collisions are handled locally by block accretion instead.
         let locked = w.polarity.contains_key(&(a, b)) && ccf > 0.6 && vrel < 20.0;
         if locked || static_long {
+            if locked { w.stats.weld_locked += 1; } else { w.stats.weld_static += 1; }
             if w.plates[a as usize].n <= w.plates[b as usize].n { merges.push((a, b)); } else { merges.push((b, a)); }
         }
     }
@@ -909,6 +934,7 @@ fn merge_and_cleanup(w: &mut World) {
     for pc in &w.parcels { if pc.alive { counts[pc.plate as usize] += 1; } }
     let tiny_n = (30.0 * w.n_scale).round() as usize;
     let tiny: Vec<u32> = (0..w.plates.len()).filter(|&a| w.plates[a].alive && counts[a] < tiny_n).map(|a| a as u32).collect();
+    w.stats.dissolved += tiny.len();
     if !tiny.is_empty() {
         let mut adopt: Vec<(usize, u32)> = vec![];
         {

@@ -12,7 +12,12 @@ pub fn update_omegas(w: &mut World) {
     let mut slab = vec![0.0f64; np];
     let mut suction = vec![0.0f64; np];
     let area = s * s; // each parcel represents ~s^2 steradians
-    let len = s;      // each boundary parcel represents ~s radians of boundary
+    // Boundary forces act on every parcel within `band` of the other plate. Parcels are consumed at 0.8 s
+    // and created at 0.9-1.8 s, so a narrow band's occupancy flickered with each step; a 3 s band always
+    // holds ~2.2 rows, and `len` is normalised so the force per unit boundary length is the rule's value
+    // (calibrated to the 0.7-row occupancy of the original 1.5 s band) independent of dt and spacing.
+    let band = 3.0 * s;
+    let len = s * 0.55;
 
     for (i, pc) in w.parcels.iter().enumerate() {
         if !pc.alive { continue; }
@@ -25,7 +30,7 @@ pub fn update_omegas(w: &mut World) {
             }
         }
         let b = match w.binfo.get(i) { Some(Some(b)) => *b, _ => continue };
-        if b.other == pc.plate || b.dist >= 1.5 * s { continue; }
+        if b.other == pc.plate || b.dist >= band { continue; }
         let pj = &w.parcels[b.oidx as usize];
         if pj.plate != b.other { continue; }
         let mut f = [0.0; 3];
