@@ -86,7 +86,7 @@ less than a spacing per step:
 
 This takes ~15× longer than the 40K default (about 25 minutes for 1000 Myr on 12 cores).
 Three times the default linear resolution (37 km spacing, 360K parcels, 3072-px maps) is
-about 90 minutes; four times (28 km, 640K parcels, 4096-px maps) about 3-4 hours:
+about 90 minutes; four times (28 km, 640K parcels, 4096-px maps) about 9 hours:
 
 ```bash
 ./target/release/tectonic --parcels 360000 --width 3072 --dt 0.33 --out out/hr360
@@ -120,17 +120,22 @@ equator (1024 px ≈ 39 km/px, 2048 px ≈ 20 km/px).
 - `src/bin/viewer.rs` + `viewer/index.html` — localhost server + WebGL globe viewer
 - `src/gplates.rs` — GPlates export (rotations, GPML, GMT, raster sequences)
 
-## Status (v0)
+## Status (v0.3)
 
-Validated on three seeds at 40K and one at 160K parcels over 1000 Myr: 6–16 plates throughout,
-Earth-like speeds (mean 10–35 km/Myr), 11–22 rifts per Gyr, continents stay coherent,
-collision belts form and lock, failed rifts close and fill, hotspot chains and shelves persist.
+Runs are reproducible (same seed ⇒ identical log) and the dynamics are step- and
+resolution-independent to within chaotic scatter (see the sweep recipe above). Latest
+production run: 640K parcels / 28 km / 4096 px, 1000 Myr in ~9 h — 8–12 plates throughout,
+15 rifts, 195 subduction initiations, 12 back-arc basins, sea level −420…+120 m, continents
+coherent, with collision belts, arcs, back-arc basins, cratonic highs and textured sea floor.
 Subduction initiates only after compression builds (old passive margins, exhausted shortening
 budget, or next to an existing trench); rifts nucleate at weaknesses and propagate along them
 before splitting a plate; old slabs roll back and open back-arc basins behind detached arcs;
 sea level is eustatic; rendered elevation carries tectonically-modulated sub-parcel detail.
-Known gaps: continental area drifts a few percent per Gyr, no fracture zones, arc detachment
-is probabilistic, and the detail layer is noise rather than a process model. See
+Known gaps: **continental area shrinks ~30 % per Gyr at high resolution** (collisional
+shortening is not balanced by arc/sediment growth — the main open physics problem), plate
+speeds still rise somewhat with resolution (boundary length grows as boundaries get rougher),
+no fracture zones, arc detachment is probabilistic, and the detail layer is noise rather than
+a process model. See
 [docs/RULES.md](docs/RULES.md).
 
 ## Reference
