@@ -2,6 +2,7 @@
 //! resisted by mantle drag; continental keels add drag. No inertia: omega solves D*omega = torque.
 use crate::geom::*;
 use crate::world::*;
+use std::collections::HashMap;
 
 pub fn update_omegas(w: &mut World) {
     let np = w.plates.len();
@@ -18,6 +19,24 @@ pub fn update_omegas(w: &mut World) {
     // (calibrated to the 0.7-row occupancy of the original 1.5 s band) independent of dt and spacing.
     let band = 3.0 * s;
     let len = s * 0.55;
+
+    // Normalise boundary forces by a smoothed boundary length: at fine spacing the boundary is rougher,
+    // its measured length grows, and per-parcel forces would over-count. Count the contact parcels per
+    // ~250 km cell and attenuate when a cell holds more than a straight boundary segment would.
+    let cell = 250.0 / R_KM;
+    let cdim = (2.0 / cell).ceil() as i32 + 2;
+    let ckey = |p: V3| -> i32 {
+        let c = |v: f64| ((v + 1.0) / cell).floor() as i32 + 1;
+        c(p[0]) + cdim * (c(p[1]) + cdim * c(p[2]))
+    };
+    let mut occupancy: HashMap<(u32, u32, i32), f64> = HashMap::new();
+    for (i, pc) in w.parcels.iter().enumerate() {
+        if !pc.alive { continue; }
+        let Some(Some(b)) = w.binfo.get(i) else { continue };
+        if b.other == pc.plate || b.dist >= band { continue; }
+        *occupancy.entry((pc.plate, b.other, ckey(pc.pos))).or_insert(0.0) += 1.0;
+    }
+    let expected = (cell / s) * 2.2; // contact parcels a straight boundary would put in one cell
 
     for (i, pc) in w.parcels.iter().enumerate() {
         if !pc.alive { continue; }
@@ -44,7 +63,8 @@ pub fn update_omegas(w: &mut World) {
                         let g = (age / 80.0).clamp(0.2, 1.0);
                         let m = p.k_slab * len * g;
                         f = add(f, scale(b.n, m));
-                        slab[a] += m;
+                        let occ = occupancy.get(&(pc.plate, b.other, ckey(r))).copied().unwrap_or(1.0);
+                        slab[a] += m * (expected / occ).min(1.0);
                     } else {
                         // Continent entering a trench resists (Rule IV: collision is what stops subduction).
                         f = add(f, scale(b.n, -p.k_coll * len));
@@ -58,7 +78,8 @@ pub fn update_omegas(w: &mut World) {
                     let g = (age / 80.0).clamp(0.2, 1.0);
                     let m = p.k_suction * len * g;
                     f = add(f, scale(b.n, m));
-                    suction[a] += m;
+                    let occ = occupancy.get(&(pc.plate, b.other, ckey(r))).copied().unwrap_or(1.0);
+                    suction[a] += m * (expected / occ).min(1.0);
                 }
             } else {
                 // Convergence at a contact that has not started subducting is resisted: compression
@@ -76,7 +97,9 @@ pub fn update_omegas(w: &mut World) {
                 f = add(f, scale(b.n, -p.k_rift * len));
             }
         }
-        torque[a] = add(torque[a], cross(r, f));
+        let occ = occupancy.get(&(pc.plate, b.other, ckey(r))).copied().unwrap_or(1.0);
+        let norm = (expected / occ).min(1.0);
+        torque[a] = add(torque[a], scale(cross(r, f), norm));
     }
 
     for a in 0..np {

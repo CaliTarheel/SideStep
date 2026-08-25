@@ -94,6 +94,7 @@ pub struct Stats {
     pub weld_locked: usize,
     pub retired: usize,
     pub dissolved: usize,
+    pub deposited: usize,
     pub rifts: usize,
     pub merges: usize,
     pub mean_v: f64,
@@ -310,6 +311,9 @@ pub struct World {
     /// Ocean volume at t = 0 (mean water column per parcel, m) and the current eustatic sea level (m).
     pub sea_v0: Option<f64>,
     pub sea_level: f64,
+    /// Sediment reservoir: crustal volume (km thickness x steradian area) eroded off high ground,
+    /// waiting to prograde continental margins.
+    pub sediment: f64,
     pub rng: ChaCha8Rng,
     pub hash: SpatialHash,
     pub binfo: Vec<Option<BInfo>>,
@@ -394,7 +398,7 @@ impl World {
         let mut w = World {
             hash: SpatialHash::new(1.5 * s), p, t: 0.0, s, n_scale, pair_ncc: HashMap::new(),
             rot: vec![IDENT; n_plates], rot_hist: vec![], parcels, plates, grid, hotspots,
-            polarity: HashMap::new(), pair_absorbed: HashMap::new(), pair_ccf: HashMap::new(), rift_pairs: HashMap::new(), static_myr: HashMap::new(), pair_compress: HashMap::new(), rifts: vec![], arc_plates: HashMap::new(), hot_drift, detail_noise, sea_v0: None, sea_level: 0.0, rng, binfo: vec![], stats: Stats::default(), weak_noise,
+            polarity: HashMap::new(), pair_absorbed: HashMap::new(), pair_ccf: HashMap::new(), rift_pairs: HashMap::new(), static_myr: HashMap::new(), pair_compress: HashMap::new(), rifts: vec![], arc_plates: HashMap::new(), hot_drift, detail_noise, sea_v0: None, sea_level: 0.0, sediment: 0.0, rng, binfo: vec![], stats: Stats::default(), weak_noise,
         };
         w.rebuild_hash();
         crate::step::plate_stats(&mut w);

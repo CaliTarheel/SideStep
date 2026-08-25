@@ -384,7 +384,7 @@ fn relax(w: &mut World) {
         if !pc.alive { return; }
         if pc.kind == Kind::Continental {
             pc.thick += deltas[i];
-            // Slow net loss of high-standing crust to the oceans (sediment leaving the continent).
+            // Slow loss of high-standing crust: the volume goes to the sediment reservoir (see below).
             if pc.thick > 38.0 { pc.thick -= (pc.thick - 38.0) / (4.0 * p.erosion_tau) * dt; }
             // Stretching at a divergent boundary thins the margin, most at the coast, tapering inland
             // (a graded passive margin: shelf, slope, hinge).
@@ -411,6 +411,54 @@ fn relax(w: &mut World) {
             }
         }
     });
+    // Erosion income: the volume the loss term removed this step (same formula, summed).
+    {
+        let income: f64 = w.parcels.par_iter().map(|pc| {
+            if pc.alive && pc.kind == Kind::Continental && pc.thick > 38.0 {
+                (pc.thick - 38.0) / (4.0 * p.erosion_tau) * dt * s * s
+            } else { 0.0 }
+        }).sum();
+        w.sediment += income;
+    }
+    // Sediment return (closes the continental area budget): the reservoir buys conversions of
+    // intraplate ocean floor at continental margins into 22 km shelf crust (cost: 15 km of new crust
+    // over one parcel; the rest of the column is mantle rise). Only sites within reach of thick
+    // continental interior qualify, so shelves prograde to a natural width and stop - no runaway.
+    {
+        let cost = 15.0 * s * s;
+        if w.sediment > cost {
+            let r_n = 1.6 * s;
+            let r_int = w.km(300.0);
+            let binfo = &w.binfo;
+            let mut sites: Vec<(usize, f64)> = (0..w.parcels.len()).into_par_iter().filter_map(|i| {
+                let pc = &w.parcels[i];
+                if !pc.alive || pc.kind != Kind::Oceanic || t - pc.birth < 10.0 { return None; }
+                if let Some(Some(_)) = binfo.get(i) { return None; } // not at a plate boundary
+                let (mut n_all, mut n_cont, mut interior) = (0usize, 0usize, false);
+                w.hash.query(pc.pos, r_int.max(r_n), |k| {
+                    let pk = &w.parcels[k as usize];
+                    if k as usize == i || !pk.alive { return; }
+                    let d = dist(pk.pos, pc.pos);
+                    if d < r_n { n_all += 1; if pk.kind == Kind::Continental && pk.plate == pc.plate { n_cont += 1; } }
+                    if d < r_int && pk.kind == Kind::Continental && pk.plate == pc.plate && pk.thick > 34.0 { interior = true; }
+                });
+                if n_cont >= 3 && n_cont * 2 >= n_all && interior { Some((i, w.rng_f64_hash(i))) } else { None }
+            }).collect();
+            sites.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            for (i, _) in sites {
+                if w.sediment < cost { break; }
+                let pc = &mut w.parcels[i];
+                if pc.kind != Kind::Oceanic { continue; }
+                pc.kind = Kind::Continental;
+                pc.thick = 22.0;
+                pc.volc = 0.0;
+                pc.birth = t;
+                w.sediment -= cost;
+                w.stats.deposited += 1;
+                w.stats.cont_grown += 1;
+            }
+        }
+    }
     // Failed rifts fill: an intraplate strip of ocean floor enclosed by continental crust subsides under
     // sediment into a shallow basin (aulacogen) - it becomes thin continental crust, not a deep slot.
     {

@@ -131,11 +131,11 @@ Subduction initiates only after compression builds (old passive margins, exhaust
 budget, or next to an existing trench); rifts nucleate at weaknesses and propagate along them
 before splitting a plate; old slabs roll back and open back-arc basins behind detached arcs;
 sea level is eustatic; rendered elevation carries tectonically-modulated sub-parcel detail.
-Known gaps: **continental area shrinks ~30 % per Gyr at high resolution** (collisional
-shortening is not balanced by arc/sediment growth — the main open physics problem), plate
-speeds still rise somewhat with resolution (boundary length grows as boundaries get rougher),
-no fracture zones, arc detachment is probabilistic, and the detail layer is noise rather than
-a process model. See
+The crust cycle is closed: eroded volume returns as prograding shelf at continental margins,
+and continental fraction holds flat over a Gyr at 160K+ parcels (mild upward drift at 40K).
+Plate speeds agree across resolutions (boundary forces are normalised by smoothed boundary
+length). Known gaps: no fracture zones, arc detachment is probabilistic, and the detail layer
+is noise rather than a process model. See
 [docs/RULES.md](docs/RULES.md).
 
 ## Reference
