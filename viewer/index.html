@@ -39,6 +39,10 @@
 <canvas id="gl"></canvas>
 <div id="top">
   <div id="title">tectonic<span id="run"></span></div>
+  <div class="seg" id="modeseg">
+    <button data-mode="globe" class="on">Globe</button>
+    <button data-mode="map">Map</button>
+  </div>
   <div class="seg" id="layers">
     <button data-layer="elev" class="on">Elevation</button>
     <button data-layer="plates">Plates</button>
@@ -49,7 +53,7 @@
   <label class="chk"><input type="checkbox" id="light" checked> shading</label>
   <div id="stats"></div>
 </div>
-<div id="help">drag: rotate · wheel: zoom · ←/→: step · space: play · click chart: jump</div>
+<div id="help">drag: rotate/pan · wheel: zoom · m: globe/map · ←/→: step · space: play · click chart: jump</div>
 <div id="bkey" style="display:none">
   <b>Boundaries</b>
   <span><i style="background:#ff3b30"></i>trench (subducting side)</span>
@@ -62,6 +66,7 @@
   <span><i style="background:#fff050"></i>active hotspot</span>
 </div>
 <div id="load"></div>
+<div id="coords" style="position:absolute; right:12px; bottom:140px; color:var(--dim); font-size:11px; font-variant-numeric:tabular-nums;"></div>
 <div id="bottom">
   <div id="row">
     <button id="play" title="play / pause">▶</button>
@@ -76,7 +81,7 @@
 <script>
 'use strict';
 // ---------- data ----------
-const state = { times: [], idx: 0, layer: 'elev', playing: false, speed: 30, log: new Map(), events: [], tex: new Map(), pending: new Set(), spin: false, light: true };
+const state = { times: [], idx: 0, layer: 'elev', playing: false, speed: 30, log: new Map(), events: [], tex: new Map(), pending: new Set(), spin: false, light: true, mode: 'globe', map: { cx: 0.5, cy: 0.5, zoom: 1 } };
 const $ = id => document.getElementById(id);
 
 async function loadIndex() {
@@ -199,6 +204,11 @@ for (const b of $('layers').querySelectorAll('button')) b.addEventListener('clic
   b.classList.add('on'); state.layer = b.dataset.layer; setIdx(state.idx); preloadAround(state.idx); updateLoad();
   $('bkey').style.display = state.layer === 'bounds' ? 'flex' : 'none';
 });
+for (const b of $('modeseg').querySelectorAll('button')) b.addEventListener('click', () => {
+  for (const o of $('modeseg').querySelectorAll('button')) o.classList.remove('on');
+  b.classList.add('on'); state.mode = b.dataset.mode;
+  $('coords').textContent = '';
+});
 function togglePlay() { state.playing = !state.playing; $('play').textContent = state.playing ? '❚❚' : '▶'; if (state.playing && state.idx >= state.times.length - 1) setIdx(0); }
 window.addEventListener('keydown', e => {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') e.target.blur();
@@ -207,6 +217,7 @@ window.addEventListener('keydown', e => {
   else if (e.code === 'ArrowLeft') { setIdx(state.idx - 1); }
   else if (e.code === 'Home') { setIdx(0); }
   else if (e.code === 'End') { setIdx(state.times.length - 1); }
+  else if (e.code === 'KeyM') { $('modeseg').querySelector(state.mode === 'globe' ? '[data-mode="map"]' : '[data-mode="globe"]').click(); }
 });
 
 // ---------- WebGL globe ----------
@@ -231,6 +242,38 @@ void main(){
 }`;
 function shader(type, src) { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; }
 const prog = gl.createProgram(); gl.attachShader(prog, shader(gl.VERTEX_SHADER, vsrc)); gl.attachShader(prog, shader(gl.FRAGMENT_SHADER, fsrc)); gl.linkProgram(prog); gl.useProgram(prog);
+// --- flat equirectangular map program ---
+const vsrcMap = `
+attribute vec2 aQ; varying vec2 vQ;
+void main(){ vQ = aQ; gl_Position = vec4(aQ * 2.0 - 1.0, 0.0, 1.0); }`;
+const fsrcMap = `
+precision mediump float;
+uniform sampler2D uTex; uniform vec2 uCenter; uniform vec2 uSpan; uniform float uHasTex;
+varying vec2 vQ;
+void main(){
+  vec2 uv = uCenter + (vQ - 0.5) * uSpan;
+  float inY = step(0.0, uv.y) * step(uv.y, 1.0);
+  vec3 c = uHasTex > 0.5 ? texture2D(uTex, vec2(fract(uv.x), clamp(uv.y, 0.0, 1.0))).rgb : vec3(0.08, 0.10, 0.16);
+  c = mix(vec3(0.04, 0.05, 0.07), c, inY);
+  vec2 g = abs(fract(uv * vec2(12.0, 6.0)) - 0.5);              // graticule every 30 degrees
+  float px = fwidth(uv.x) * 12.0;
+  float line = 1.0 - smoothstep(0.0, max(px * 1.5, 0.004), min(g.x, g.y));
+  c = mix(c, vec3(0.65, 0.68, 0.75), line * 0.10 * inY);
+  gl_FragColor = vec4(c, 1.0);
+}`;
+let mapProg = null, mapLoc = null, quadBuf = null;
+try {
+  gl.getExtension('OES_standard_derivatives');
+  mapProg = gl.createProgram();
+  gl.attachShader(mapProg, shader(gl.VERTEX_SHADER, vsrcMap));
+  gl.attachShader(mapProg, shader(gl.FRAGMENT_SHADER, '#extension GL_OES_standard_derivatives : enable\n' + fsrcMap));
+  gl.linkProgram(mapProg);
+  mapLoc = { q: gl.getAttribLocation(mapProg, 'aQ'), center: gl.getUniformLocation(mapProg, 'uCenter'), span: gl.getUniformLocation(mapProg, 'uSpan'), has: gl.getUniformLocation(mapProg, 'uHasTex') };
+  quadBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0,0, 1,0, 0,1, 0,1, 1,0, 1,1]), gl.STATIC_DRAW);
+} catch (e) { mapProg = null; }
+
 const loc = { pos: gl.getAttribLocation(prog, 'aPos'), uv: gl.getAttribLocation(prog, 'aUV'), proj: gl.getUniformLocation(prog, 'uProj'), view: gl.getUniformLocation(prog, 'uView'), model: gl.getUniformLocation(prog, 'uModel'), light: gl.getUniformLocation(prog, 'uLight'), shade: gl.getUniformLocation(prog, 'uShade'), has: gl.getUniformLocation(prog, 'uHasTex') };
 
 // sphere mesh; y is the polar axis (matches the engine). Equirectangular: u = lon/360 + 0.5, v = lat/180 + 0.5.
@@ -239,9 +282,10 @@ const loc = { pos: gl.getAttribLocation(prog, 'aPos'), uv: gl.getAttribLocation(
   for (let j = 0; j <= NLAT; j++) { const lat = Math.PI * (j / NLAT - 0.5); const cy = Math.cos(lat), sy = Math.sin(lat);
     for (let i = 0; i <= NLON; i++) { const lon = 2 * Math.PI * (i / NLON - 0.5); pos.push(cy * Math.cos(lon), sy, cy * Math.sin(lon)); uv.push(i / NLON, j / NLAT); } }
   for (let j = 0; j < NLAT; j++) for (let i = 0; i < NLON; i++) { const a = j * (NLON + 1) + i, b = a + NLON + 1; idx.push(a, b, a + 1, a + 1, b, b + 1); }
-  const vb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vb); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(pos), gl.STATIC_DRAW); gl.enableVertexAttribArray(loc.pos); gl.vertexAttribPointer(loc.pos, 3, gl.FLOAT, false, 0, 0);
-  const ub = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, ub); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(uv), gl.STATIC_DRAW); gl.enableVertexAttribArray(loc.uv); gl.vertexAttribPointer(loc.uv, 2, gl.FLOAT, false, 0, 0);
+  const vb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vb); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(pos), gl.STATIC_DRAW);
+  const ub = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, ub); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(uv), gl.STATIC_DRAW);
   const ib = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(idx), gl.STATIC_DRAW);
+  state.sphere = { vb, ub, ib };
   state.nIdx = idx.length;
 })();
 
@@ -250,8 +294,45 @@ const cam = { yaw: 0.6, pitch: 0.35, dist: 2.7 };
 let dragging = false, lx = 0, ly = 0;
 canvas.addEventListener('mousedown', e => { dragging = true; lx = e.clientX; ly = e.clientY; canvas.classList.add('drag'); });
 window.addEventListener('mouseup', () => { dragging = false; canvas.classList.remove('drag'); });
-window.addEventListener('mousemove', e => { if (!dragging) return; const k = 0.0055 * Math.min(1, cam.dist / 2.7); cam.yaw -= (e.clientX - lx) * k; cam.pitch += (e.clientY - ly) * k; cam.pitch = Math.max(-1.5, Math.min(1.5, cam.pitch)); lx = e.clientX; ly = e.clientY; });
-canvas.addEventListener('wheel', e => { e.preventDefault(); cam.dist *= Math.exp(e.deltaY * 0.0012); cam.dist = Math.max(1.25, Math.min(8, cam.dist)); }, { passive: false });
+window.addEventListener('mousemove', e => {
+  if (state.mode === 'map') {
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    const sp = mapSpan(W, H);
+    if (dragging) {
+      state.map.cx -= (e.clientX - lx) / W * sp[0];
+      state.map.cy += (e.clientY - ly) / H * sp[1];
+      state.map.cy = Math.max(0.05, Math.min(0.95, state.map.cy));
+      lx = e.clientX; ly = e.clientY;
+    }
+    const r = canvas.getBoundingClientRect();
+    const u = state.map.cx + ((e.clientX - r.left) / W - 0.5) * sp[0];
+    const v = state.map.cy + (0.5 - (e.clientY - r.top) / H) * sp[1];
+    if (v >= 0 && v <= 1) {
+      const lon = ((u % 1 + 1) % 1 - 0.5) * 360, lat = (v - 0.5) * 180;
+      $('coords').textContent = lat.toFixed(1) + '\u00b0, ' + lon.toFixed(1) + '\u00b0';
+    } else { $('coords').textContent = ''; }
+    return;
+  }
+  if (!dragging) return;
+  const k = 0.0055 * Math.min(1, cam.dist / 2.7); cam.yaw -= (e.clientX - lx) * k; cam.pitch += (e.clientY - ly) * k; cam.pitch = Math.max(-1.5, Math.min(1.5, cam.pitch)); lx = e.clientX; ly = e.clientY;
+});
+function mapSpan(W, H) { const A = W / Math.max(1, H); return [A / 2 / state.map.zoom, 1 / state.map.zoom]; }
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  if (state.mode === 'map') {
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    const r = canvas.getBoundingClientRect();
+    const fx = (e.clientX - r.left) / W - 0.5, fy = 0.5 - (e.clientY - r.top) / H;
+    const sp0 = mapSpan(W, H);
+    state.map.zoom = Math.max(1, Math.min(60, state.map.zoom * Math.exp(-e.deltaY * 0.0012)));
+    const sp1 = mapSpan(W, H);
+    state.map.cx += fx * (sp0[0] - sp1[0]);
+    state.map.cy += fy * (sp0[1] - sp1[1]);
+    state.map.cy = Math.max(0.05, Math.min(0.95, state.map.cy));
+    return;
+  }
+  cam.dist *= Math.exp(e.deltaY * 0.0012); cam.dist = Math.max(1.25, Math.min(8, cam.dist));
+}, { passive: false });
 canvas.addEventListener('touchstart', e => { if (e.touches.length === 1) { dragging = true; lx = e.touches[0].clientX; ly = e.touches[0].clientY; } }, { passive: true });
 canvas.addEventListener('touchmove', e => { if (dragging && e.touches.length === 1) { const t = e.touches[0]; cam.yaw -= (t.clientX - lx) * 0.006; cam.pitch += (t.clientY - ly) * 0.006; lx = t.clientX; ly = t.clientY; } }, { passive: true });
 canvas.addEventListener('touchend', () => dragging = false);
@@ -279,6 +360,30 @@ function frame(now) {
   if (canvas.width !== W || canvas.height !== H) { canvas.width = W; canvas.height = H; drawChart(); }
   gl.viewport(0, 0, W, H); gl.clearColor(0.043, 0.051, 0.07, 1); gl.enable(gl.DEPTH_TEST); gl.enable(gl.CULL_FACE); gl.cullFace(gl.BACK);
   gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  if (state.mode === 'map' && mapProg) {
+    const t2 = state.times[state.idx];
+    let tex2 = state.tex.get(texKey(t2, state.layer));
+    if (!tex2) { for (let d = 1; d < state.times.length && !tex2; d++) { tex2 = state.tex.get(texKey(state.times[state.idx - d], state.layer)) || state.tex.get(texKey(state.times[state.idx + d], state.layer)); } }
+    gl.disable(gl.DEPTH_TEST); gl.disable(gl.CULL_FACE);
+    gl.useProgram(mapProg);
+    gl.disableVertexAttribArray(loc.pos); gl.disableVertexAttribArray(loc.uv);
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+    gl.enableVertexAttribArray(mapLoc.q);
+    gl.vertexAttribPointer(mapLoc.q, 2, gl.FLOAT, false, 0, 0);
+    const sp = mapSpan(canvas.clientWidth, canvas.clientHeight);
+    gl.uniform2f(mapLoc.center, state.map.cx, state.map.cy);
+    gl.uniform2f(mapLoc.span, sp[0], sp[1]);
+    gl.uniform1f(mapLoc.has, tex2 ? 1 : 0);
+    if (tex2) { gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tex2); }
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    gl.disableVertexAttribArray(mapLoc.q);
+    requestAnimationFrame(frame);
+    return;
+  }
+  gl.useProgram(prog);
+  gl.bindBuffer(gl.ARRAY_BUFFER, state.sphere.vb); gl.enableVertexAttribArray(loc.pos); gl.vertexAttribPointer(loc.pos, 3, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, state.sphere.ub); gl.enableVertexAttribArray(loc.uv); gl.vertexAttribPointer(loc.uv, 2, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, state.sphere.ib);
   const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
   const eye = [cam.dist * cp * Math.cos(cam.yaw), cam.dist * sp, cam.dist * cp * Math.sin(cam.yaw)];
   gl.uniformMatrix4fv(loc.proj, false, new Float32Array(perspective(0.7, W / H, 0.05, 50)));

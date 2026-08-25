@@ -37,7 +37,10 @@ Interactive 3D globe of a run: rotate, zoom, scrub or play through time, switch 
 ./target/release/viewer out/run1 8077
 ```
 
-Then open <http://127.0.0.1:8077/>. Drag to rotate, wheel to zoom, ←/→ step one slice, space
+Then open <http://127.0.0.1:8077/>. A **Globe | Map** toggle (or `m`) switches between the 3D
+globe and a flat equirectangular projection — in map mode, drag pans, the wheel zooms about the
+cursor, longitude wraps, a 30° graticule overlays the layer, and the cursor's lat/lon is shown.
+On the globe: drag to rotate, wheel to zoom. Either way ←/→ step one slice, space
 plays, click the timeline to jump; ▲/▼ marks on the timeline are rift / suture events. The
 viewer is a single self-contained page ([viewer/index.html](viewer/index.html), WebGL, no
 external libraries) embedded in the `viewer` binary; it serves the run directory read-only on
