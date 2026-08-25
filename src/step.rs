@@ -430,19 +430,28 @@ fn relax(w: &mut World) {
             let r_n = 1.6 * s;
             let r_int = w.km(300.0);
             let binfo = &w.binfo;
+            // Two stages: the cheap short-range margin test first (1.6 spacings), then the expensive
+            // 300 km interior test only for the few parcels on a margin front. (Doing the wide query for
+            // every ocean parcel made the 640K run 6x slower.)
             let mut sites: Vec<(usize, f64)> = (0..w.parcels.len()).into_par_iter().filter_map(|i| {
                 let pc = &w.parcels[i];
                 if !pc.alive || pc.kind != Kind::Oceanic || t - pc.birth < 10.0 { return None; }
                 if let Some(Some(_)) = binfo.get(i) { return None; } // not at a plate boundary
-                let (mut n_all, mut n_cont, mut interior) = (0usize, 0usize, false);
-                w.hash.query(pc.pos, r_int.max(r_n), |k| {
+                let (mut n_all, mut n_cont) = (0usize, 0usize);
+                w.hash.query(pc.pos, r_n, |k| {
                     let pk = &w.parcels[k as usize];
                     if k as usize == i || !pk.alive { return; }
                     let d = dist(pk.pos, pc.pos);
                     if d < r_n { n_all += 1; if pk.kind == Kind::Continental && pk.plate == pc.plate { n_cont += 1; } }
-                    if d < r_int && pk.kind == Kind::Continental && pk.plate == pc.plate && pk.thick > 34.0 { interior = true; }
                 });
-                if n_cont >= 3 && n_cont * 2 >= n_all && interior { Some((i, w.rng_f64_hash(i))) } else { None }
+                if n_cont < 3 || n_cont * 2 < n_all { return None; }
+                let mut interior = false;
+                w.hash.query(pc.pos, r_int, |k| {
+                    if interior { return; }
+                    let pk = &w.parcels[k as usize];
+                    if pk.alive && pk.kind == Kind::Continental && pk.plate == pc.plate && pk.thick > 34.0 && dist(pk.pos, pc.pos) < r_int { interior = true; }
+                });
+                if interior { Some((i, w.rng_f64_hash(i))) } else { None }
             }).collect();
             sites.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
             for (i, _) in sites {
