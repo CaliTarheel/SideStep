@@ -127,9 +127,11 @@ equator (1024 px ≈ 39 km/px, 2048 px ≈ 20 km/px).
 
 Runs are reproducible (same seed ⇒ identical log) and the dynamics are step- and
 resolution-independent to within chaotic scatter (see the sweep recipe above). Latest
-production run: 640K parcels / 28 km / 4096 px, 1000 Myr in ~9 h — 8–12 plates throughout,
-15 rifts, 195 subduction initiations, 12 back-arc basins, sea level −420…+120 m, continents
-coherent, with collision belts, arcs, back-arc basins, cratonic highs and textured sea floor.
+production run: 640K parcels / 28 km / 4096 px, 1000 Myr in ~16 h — 4–12 plates (ending in a
+supercontinent phase), 10 rifts, 122 subduction initiations, 15 back-arc basins, sea level
+−270…+100 m, continental fraction 0.29 → 0.27 over the Gyr (the sediment return path covers
+about half of collisional loss at this resolution), continents coherent, with collision belts,
+arcs, back-arc basins, cratonic highs and textured sea floor.
 Subduction initiates only after compression builds (old passive margins, exhausted shortening
 budget, or next to an existing trench); rifts nucleate at weaknesses and propagate along them
 before splitting a plate; old slabs roll back and open back-arc basins behind detached arcs;
