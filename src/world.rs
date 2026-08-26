@@ -33,6 +33,8 @@ pub struct Parcel {
     pub arc_t: f64,
     /// Last time a propagating rift passed through this parcel.
     pub rift_t: f64,
+    /// Intraplate tension proxy (opposing boundary pulls), updated every `stress_every` Myr.
+    pub stress: f32,
     /// Flexural deepening weight (1 at the trench, 0 at the outer edge of the flexural bulge).
     pub trench_w: f64,
     pub alive: bool,
@@ -95,6 +97,9 @@ pub struct Stats {
     pub retired: usize,
     pub dissolved: usize,
     pub deposited: usize,
+    pub stress_p50: f32,
+    pub stress_p95: f32,
+    pub stress_max: f32,
     pub rifts: usize,
     pub merges: usize,
     pub mean_v: f64,
@@ -128,6 +133,14 @@ pub struct Params {
     pub rift_push_myr: f64,
     /// Rift tip propagation speed (km/Myr).
     pub rift_prop_v: f64,
+    /// How often (Myr) the intraplate stress field is re-evaluated.
+    pub stress_every: f64,
+    /// Decay length (km) of a boundary pull's influence on interior stress.
+    pub stress_l_km: f64,
+    /// Fraction of the net (plate-moving) force subtracted from the opposing-pull tension.
+    pub stress_beta: f64,
+    /// Arc parcels need this much tension (x rift_threshold) to detach for rollback.
+    pub backarc_stress: f64,
     /// Resistance at a convergent contact that has no subduction zone yet (per unit length).
     pub k_resist: f64,
     /// Oceanic lithosphere this old (Myr) can start subducting after a little compression.
@@ -155,7 +168,8 @@ pub struct Params {
     /// Phanerozoic speed limit, km/Myr (Rule II: ~20 cm/yr).
     pub v_max: f64,
     pub omega_relax: f64,
-    // --- rifting (Rules III, V, XI) ---
+    // --- rifting (Rules III, V, XI): stress-based ---
+    /// Tension/strength ratio above which a rift can nucleate.
     pub rift_threshold: f64,
     pub rift_rate: f64,
     // --- crust evolution ---
@@ -174,9 +188,9 @@ impl Params {
         Params {
             seed: 42, n_parcels: 40_000, n_plates: 12, years: 1000.0, dt: 1.0, slice_every: 10.0,
             width: 1024, out: "out/run".into(), cont_frac: 0.30, n_hotspots: 12,
-            k_slab: 0.015, k_ridge: 0.004, k_coll: 0.2, k_suction: 0.003, k_rift: 0.012, rift_push_myr: 60.0, rift_prop_v: 150.0, k_resist: 0.05, init_age: 60.0, init_short: 150.0, lock_km: 500.0, virus_km: 600.0, rollback_age: 80.0, rollback_rate: 0.012, backarc_km: 300.0, backarc_myr: 40.0, rollback_v: 30.0, detail: true, drag_ocean: 1.0, drag_cont: 3.0,
+            k_slab: 0.015, k_ridge: 0.004, k_coll: 0.2, k_suction: 0.003, k_rift: 0.012, rift_push_myr: 60.0, rift_prop_v: 150.0, stress_every: 2.0, stress_l_km: 4000.0, stress_beta: 0.6, backarc_stress: 0.5, k_resist: 0.05, init_age: 60.0, init_short: 150.0, lock_km: 500.0, virus_km: 600.0, rollback_age: 80.0, rollback_rate: 0.012, backarc_km: 300.0, backarc_myr: 40.0, rollback_v: 30.0, detail: true, drag_ocean: 1.0, drag_cont: 3.0,
             v_max: 200.0, omega_relax: 0.5,
-            rift_threshold: 1.0, rift_rate: 0.05,
+            rift_threshold: 20.0, rift_rate: 0.04,
             arc_rate: 0.04, hot_rate: 2.0, erosion_tau: 40.0, volc_tau: 60.0,
             thick_coeff: 0.015, thin_coeff: 0.011, accrete_rate: 0.01,
         }
@@ -213,6 +227,10 @@ impl Params {
                 "k-rift" => p.k_rift = f(),
                 "rift-push-myr" => p.rift_push_myr = f(),
                 "rift-prop-v" => p.rift_prop_v = f(),
+                "stress-every" => p.stress_every = f(),
+                "stress-l-km" => p.stress_l_km = f(),
+                "stress-beta" => p.stress_beta = f(),
+                "backarc-stress" => p.backarc_stress = f(),
                 "k-resist" => p.k_resist = f(),
                 "init-age" => p.init_age = f(),
                 "init-short" => p.init_short = f(),
@@ -300,6 +318,11 @@ pub struct World {
     pub static_myr: HashMap<(u32, u32), f64>,
     /// Shortening (km) taken up at convergent contacts that have not started subducting yet.
     pub pair_compress: HashMap<(u32, u32), f64>,
+    /// Boundary tractions coarsened to ~250 km cells, per plate: (cell centroid, net force), rebuilt
+    /// each step in forces.rs and consumed by the stress-field evaluation.
+    pub cell_tractions: HashMap<u32, Vec<(V3, V3)>>,
+    /// Last time the stress field was evaluated.
+    pub stress_eval_t: f64,
     /// Rifts currently propagating.
     pub rifts: Vec<ActiveRift>,
     /// Detached arc plates: arc plate -> (parent upper plate, lower plate, detachment time).
@@ -374,7 +397,7 @@ impl World {
                 }
             }
             let birth = if kind == Kind::Continental { -3000.0 } else { -(70.0 + 60.0 * age_noise.eval(pos)).clamp(2.0, 160.0) };
-            parcels.push(Parcel { pos, plate: best.0, kind, birth, thick, volc: 0.0, trench_t: NEVER, suture_t: NEVER, hot_t: NEVER, arc_t: NEVER, rift_t: NEVER, trench_w: 0.0, alive: true });
+            parcels.push(Parcel { pos, plate: best.0, kind, birth, thick, volc: 0.0, trench_t: NEVER, suture_t: NEVER, hot_t: NEVER, arc_t: NEVER, rift_t: NEVER, stress: 0.0, trench_w: 0.0, alive: true });
         }
 
         let plates = (0..p.n_plates).map(|_| {
@@ -398,7 +421,7 @@ impl World {
         let mut w = World {
             hash: SpatialHash::new(1.5 * s), p, t: 0.0, s, n_scale, pair_ncc: HashMap::new(),
             rot: vec![IDENT; n_plates], rot_hist: vec![], parcels, plates, grid, hotspots,
-            polarity: HashMap::new(), pair_absorbed: HashMap::new(), pair_ccf: HashMap::new(), rift_pairs: HashMap::new(), static_myr: HashMap::new(), pair_compress: HashMap::new(), rifts: vec![], arc_plates: HashMap::new(), hot_drift, detail_noise, sea_v0: None, sea_level: 0.0, sediment: 0.0, rng, binfo: vec![], stats: Stats::default(), weak_noise,
+            polarity: HashMap::new(), pair_absorbed: HashMap::new(), pair_ccf: HashMap::new(), rift_pairs: HashMap::new(), static_myr: HashMap::new(), pair_compress: HashMap::new(), cell_tractions: HashMap::new(), stress_eval_t: -1.0e9, rifts: vec![], arc_plates: HashMap::new(), hot_drift, detail_noise, sea_v0: None, sea_level: 0.0, sediment: 0.0, rng, binfo: vec![], stats: Stats::default(), weak_noise,
         };
         w.rebuild_hash();
         crate::step::plate_stats(&mut w);

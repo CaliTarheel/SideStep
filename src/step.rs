@@ -343,7 +343,7 @@ fn fill_gaps(w: &mut World) {
         placed.push(g);
         w.parcels.push(Parcel {
             pos: g, plate: pl, kind: Kind::Oceanic, birth: t, thick: 7.0, volc: 0.0,
-            trench_t: NEVER, suture_t: NEVER, hot_t: NEVER, arc_t: NEVER, rift_t: NEVER, trench_w: 0.0, alive: true,
+            trench_t: NEVER, suture_t: NEVER, hot_t: NEVER, arc_t: NEVER, rift_t: NEVER, stress: 0.0, trench_w: 0.0, alive: true,
         });
     }
     w.stats.created = placed.len();
@@ -564,29 +564,96 @@ fn relax(w: &mut World) {
 
 fn rifting(w: &mut World) {
     advance_rifts(w);
-    let dt = w.p.dt;
+    // Spatially resolved intraplate tension (replaces the per-plate tension clock): for each
+    // continental parcel, sum the boundary pulls directed away from it (opposing pulls add) and
+    // subtract a fraction of the net plate-moving force (a one-sided pull mostly moves the plate).
+    // Evaluated every `stress_every` Myr; dt-independent by construction.
+    if w.t - w.stress_eval_t < w.p.stress_every { return; }
+    w.stress_eval_t = w.t;
+    let l = w.km(w.p.stress_l_km);
+    let beta = w.p.stress_beta;
+    // Stress relief: an open divergent boundary or a recent rift accommodates extension, so the
+    // lithosphere within ~1500 km of one is relaxed. This is the negative feedback that keeps a
+    // breakup from cascading into a rift storm (each split otherwise raises its neighbours' tension).
+    let r_relief = w.km(1500.0);
+    let mut relief = SpatialHash::new(r_relief.max(1.5 * w.s));
+    {
+        let t_now = w.t;
+        let srcs = w.parcels.iter().enumerate().filter_map(|(i, pc)| {
+            if !pc.alive { return None; }
+            let recent_rift = t_now - pc.rift_t < 60.0;
+            let diverging = matches!(w.binfo.get(i), Some(Some(b)) if b.conv < -CONV_EPS && b.dist < 3.0 * w.s);
+            if recent_rift || diverging { Some((pc.plate, pc.pos)) } else { None }
+        });
+        relief.build(srcs.map(|(pl, pos)| (pl, pos)));
+    }
+    {
+        let ct = &w.cell_tractions;
+        let plates = &w.plates;
+        let stresses: Vec<f32> = w.parcels.par_iter().map(|pc| {
+            if !pc.alive || pc.kind != Kind::Continental { return 0.0; }
+            let Some(cells) = ct.get(&pc.plate) else { return 0.0; };
+            if !plates[pc.plate as usize].alive { return 0.0; }
+            let (mut pull, mut net) = (0.0, [0.0; 3]);
+            for &(cp, cf) in cells {
+                let wgt = (-dist(cp, pc.pos) / l).exp();
+                let u = tangent_toward(pc.pos, cp);
+                let along = dot(cf, u);
+                if along > 0.0 { pull += along * wgt; }
+                net = add(net, scale(cf, wgt));
+            }
+            let mut t_val = (pull - beta * norm(net)).max(0.0) * 1.0e4;
+            let mut relieved = false;
+            relief.query(pc.pos, r_relief, |k| { if !relieved && k == pc.plate && true { relieved = true; } });
+            if relieved { t_val *= 0.15; }
+            t_val as f32
+        }).collect();
+        let mut vals: Vec<f32> = stresses.iter().copied().filter(|&v| v > 0.0).collect();
+        vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        if !vals.is_empty() {
+            let q = |f: f64| vals[((vals.len() - 1) as f64 * f) as usize];
+            w.stats.stress_p50 = q(0.5);
+            w.stats.stress_p95 = q(0.95);
+            w.stats.stress_max = *vals.last().unwrap();
+        }
+        for (pc, st) in w.parcels.iter_mut().zip(stresses) { pc.stress = st; }
+    }
+    // Nucleation: anywhere tension exceeds local strength, up to 3 simultaneous rifts per plate,
+    // not within ~15 degrees of an active rift.
     let np = w.plates.len();
-    // reference pull: slab pull on a 3000 km trench
-    let pull_ref = w.p.k_slab * (3000.0 / R_KM);
+    let n_min = 150.0 * w.n_scale;
+    let p_nuc = (w.p.rift_rate * w.p.stress_every).min(0.9);
     for a in 0..np {
-        let pl = w.plates[a].clone();
-        if !pl.alive || (pl.n as f64) < 300.0 * w.n_scale || (pl.n_cont as f64) < 150.0 * w.n_scale { continue; }
-        let cf = pl.n_cont as f64 / pl.n as f64;
-        if cf < 0.15 { continue; }
-        // Tension from the forces actually pulling on the plate: slab pull on its own slabs plus slab
-        // suction toward the trenches it overrides (Rule V). A stagnant plate still creeps toward failure.
-        let pulled = (0.35 + (pl.slab + pl.suction) / pull_ref).clamp(0.35, 2.5);
-        let size = (pl.n_cont as f64 / (1500.0 * w.n_scale)).sqrt().clamp(0.5, 2.0);
-        let rate = pulled * size * (0.4 + 0.6 * cf) / 400.0;
-        w.plates[a].tension += rate * dt;
-        // Sutures and hot spots weaken the lithosphere (Rules X, XI).
-        let weak = pl.n_weak as f64 / pl.n_cont.max(1) as f64;
-        let threshold = w.p.rift_threshold / (1.0 + 3.0 * weak);
-        let busy = w.rifts.iter().any(|r| r.plate == a as u32);
-        if !busy && w.plates[a].tension > threshold && w.rng.gen::<f64>() < w.p.rift_rate * dt {
-            if nucleate_rift(w, a) { w.plates[a].tension = 0.0; }
+        if !w.plates[a].alive || (w.plates[a].n_cont as f64) < n_min { continue; }
+        let n_active = w.rifts.iter().filter(|r| r.plate == a as u32).count();
+        if n_active >= 3 { continue; }
+        // best candidate parcel by tension / strength
+        let mut best: Option<(usize, f64)> = None;
+        for (i, pc) in w.parcels.iter().enumerate() {
+            if !pc.alive || pc.plate != a as u32 || pc.kind != Kind::Continental || pc.stress <= 0.0 { continue; }
+            let sc = pc.stress as f64 * (1.0 + weakness_at(w, pc.pos));
+            if best.map_or(true, |(_, bs)| sc > bs) { best = Some((i, sc)); }
+        }
+        let Some((i, sc)) = best else { continue };
+        if sc < w.p.rift_threshold { continue; }
+        let c = w.parcels[i].pos;
+        if w.rifts.iter().any(|r| r.plate == a as u32 && angle(r.nucleus, c) < 0.5) { continue; }
+        if w.rng.gen::<f64>() < p_nuc {
+            nucleate_rift_at(w, a, i);
         }
     }
+}
+
+/// Start a rift at a specific parcel, running perpendicular to the plate's motion there.
+fn nucleate_rift_at(w: &mut World, a: usize, nucleus: usize) {
+    let t = w.t;
+    let c = w.parcels[nucleus].pos;
+    let vc = surface_velocity(w.plates[a].omega, c);
+    let vn = norm(vc);
+    let vhat = if vn > 1e-6 { scale(vc, 1.0 / vn) } else { any_tangent(c) };
+    let u = normalize(cross(c, vhat));
+    w.rifts.push(ActiveRift { plate: a as u32, nucleus: c, normal: vhat, path: vec![c], tip: [c, c], dir: [u, scale(u, -1.0)], done: [false, false], born: t });
+    mark_rift(w, c);
 }
 
 /// Mean weakness of the continental crust around `p` (recent sutures, hotspot passages, thin crust).
@@ -604,34 +671,6 @@ fn weakness_at(w: &World, p: V3) -> f64 {
         }
     });
     if n > 0.0 { sc / n } else { 0.0 }
-}
-
-/// Start a rift at a weak continental parcel, running perpendicular to the plate's motion.
-fn nucleate_rift(w: &mut World, a: usize) -> bool {
-    let t = w.t;
-    let idxs: Vec<usize> = w.parcels.iter().enumerate()
-        .filter(|(_, pc)| pc.alive && pc.plate == a as u32 && pc.kind == Kind::Continental)
-        .map(|(i, _)| i).collect();
-    if idxs.is_empty() { return false; }
-    let weights: Vec<f64> = idxs.iter().map(|&i| {
-        let pc = &w.parcels[i];
-        1.0 + if t - pc.suture_t < 500.0 { 5.0 } else { 0.0 } + if t - pc.hot_t < 30.0 { 3.0 } else { 0.0 }
-    }).collect();
-    let total: f64 = weights.iter().sum();
-    let mut pick = w.rng.gen::<f64>() * total;
-    let mut nucleus = idxs[0];
-    for (k, &i) in idxs.iter().enumerate() {
-        pick -= weights[k];
-        if pick <= 0.0 { nucleus = i; break; }
-    }
-    let c = w.parcels[nucleus].pos;
-    let vc = surface_velocity(w.plates[a].omega, c);
-    let vn = norm(vc);
-    let vhat = if vn > 1e-6 { scale(vc, 1.0 / vn) } else { any_tangent(c) };
-    let u = normalize(cross(c, vhat));
-    w.rifts.push(ActiveRift { plate: a as u32, nucleus: c, normal: vhat, path: vec![c], tip: [c, c], dir: [u, scale(u, -1.0)], done: [false, false], born: t });
-    mark_rift(w, c);
-    true
 }
 
 /// A rift valley forms where the tip passes: flag the parcels and drop them by ~1.5 km of crust.
@@ -879,6 +918,26 @@ fn backarc(w: &mut World) {
         if w.arc_plates.contains_key(&upper) { continue; }
         if w.arc_plates.values().any(|&(par, low, _)| par == upper && low == lower) { continue; }
         if !w.plates[upper as usize].alive { continue; }
+        // force-based gate: the upper plate must actually be in tension behind this trench
+        // (slab suction pulling the arc away from an interior that is not following).
+        let mut st = 0.0f64;
+        let mut n_st = 0usize;
+        {
+            let hash = &w.hash;
+            let parcels = &w.parcels;
+            let r_arc2 = w.km(w.p.backarc_km);
+            for &q in pts.iter().step_by(4) {
+                hash.query(q, r_arc2, |k| {
+                    let pk = &parcels[k as usize];
+                    if pk.alive && pk.plate == upper && dist(pk.pos, q) < r_arc2 { st += pk.stress as f64; n_st += 1; }
+                });
+            }
+        }
+        let n_cont_arc = { let mut c = 0; { let hash = &w.hash; let parcels = &w.parcels; let r_arc2 = w.km(w.p.backarc_km); for &q in pts.iter().step_by(4) { hash.query(q, r_arc2, |k| { let pk = &parcels[k as usize]; if pk.alive && pk.plate == upper && pk.kind == Kind::Continental && dist(pk.pos, q) < r_arc2 { c += 1; } }); } } c };
+        let tension_ok = if n_cont_arc * 5 >= n_st.max(1) {
+            n_st > 0 && st / n_st as f64 >= w.p.backarc_stress * w.p.rift_threshold
+        } else { true }; // intra-oceanic arcs carry no stress field; the age gate alone applies
+        if !tension_ok { continue; }
         if w.rng.gen::<f64>() >= w.p.rollback_rate * dt { continue; }
         cands.push(((lower, upper), pts));
     }

@@ -48,7 +48,7 @@ pub fn parcel_elev_abs(w: &World, pc: &Parcel) -> f64 {
     e
 }
 
-struct Px { elev: f32, plate: u32, kind: u8, age: f32, cls: u8 }
+struct Px { elev: f32, plate: u32, kind: u8, age: f32, cls: u8, stress: f32 }
 
 /// Boundary / feature class of a parcel, from its current boundary info and history.
 /// 0 none, 1 trench (subducting side), 2 arc (overriding side), 3 continental collision,
@@ -122,7 +122,7 @@ pub fn render(w: &World) {
                             }
                         }
                     });
-                    if best.1 == u32::MAX { return Px { elev: 0.0, plate: u32::MAX, kind: 0, age: -1.0, cls: 0 }; }
+                    if best.1 == u32::MAX { return Px { elev: 0.0, plate: u32::MAX, kind: 0, age: -1.0, cls: 0, stress: 0.0 }; }
                     let winner = votes.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).unwrap().0;
                     let mut bi = best.1;
                     if w.parcels[bi as usize].plate != winner {
@@ -152,7 +152,7 @@ pub fn render(w: &World) {
                         } else { 12.0 };
                         elev += amp * n;
                     }
-                    Px { elev: elev as f32, plate: pc.plate, kind: if pc.kind == Kind::Continental { 1 } else { 0 }, age, cls }
+                    Px { elev: elev as f32, plate: pc.plate, kind: if pc.kind == Kind::Continental { 1 } else { 0 }, age, cls, stress: pc.stress }
                 })
                 .collect()
         })
@@ -266,6 +266,24 @@ pub fn render(w: &World) {
         }
     }
     b_img.save(format!("{}/bounds.png", dir)).expect("save bounds.png");
+
+    // Intraplate tension: hot colours where opposing boundary pulls stretch a plate.
+    let mut s_img = RgbImage::new(wd as u32, ht as u32);
+    for y in 0..ht {
+        for x in 0..wd {
+            let px = &rows[y][x];
+            let h = hypso(px.elev);
+            let lum = (0.3 * h[0] as f32 + 0.59 * h[1] as f32 + 0.11 * h[2] as f32) * 0.45;
+            let base = [lum as u8, lum as u8, (lum * 1.15) as u8];
+            let v = (px.stress / 1.5).clamp(0.0, 1.0);
+            let c = if v <= 0.01 { base } else {
+                let warm = if v < 0.5 { lerp([70, 40, 90], [220, 80, 40], v * 2.0) } else { lerp([220, 80, 40], [255, 235, 120], (v - 0.5) * 2.0) };
+                lerp(base, warm, (0.25 + 0.75 * v).min(1.0))
+            };
+            s_img.put_pixel(x as u32, y as u32, Rgb(c));
+        }
+    }
+    s_img.save(format!("{}/stress.png", dir)).expect("save stress.png");
 
     let mut meta = std::fs::File::create(format!("{}/meta.json", dir)).expect("meta");
     let land = rows.iter().flatten().filter(|p| p.elev > 0.0).count() as f64 / (wd * ht) as f64;

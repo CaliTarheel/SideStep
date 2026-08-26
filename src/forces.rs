@@ -30,6 +30,7 @@ pub fn update_omegas(w: &mut World) {
         c(p[0]) + cdim * (c(p[1]) + cdim * c(p[2]))
     };
     let mut occupancy: HashMap<(u32, u32, i32), f64> = HashMap::new();
+    let mut cells: HashMap<(u32, i32), (V3, V3, f64)> = HashMap::new();
     for (i, pc) in w.parcels.iter().enumerate() {
         if !pc.alive { continue; }
         let Some(Some(b)) = w.binfo.get(i) else { continue };
@@ -100,7 +101,20 @@ pub fn update_omegas(w: &mut World) {
         let occ = occupancy.get(&(pc.plate, b.other, ckey(r))).copied().unwrap_or(1.0);
         let norm = (expected / occ).min(1.0);
         torque[a] = add(torque[a], scale(cross(r, f), norm));
+        // coarse boundary tractions for the intraplate stress field
+        let e = cells.entry((pc.plate, ckey(r))).or_insert(([0.0; 3], [0.0; 3], 0.0));
+        e.0 = add(e.0, scale(f, norm));
+        e.1 = add(e.1, r);
+        e.2 += 1.0;
     }
+    let mut ct: HashMap<u32, Vec<(V3, V3)>> = HashMap::new();
+    let mut ckeys: Vec<(u32, i32)> = cells.keys().copied().collect();
+    ckeys.sort_unstable();
+    for k in ckeys {
+        let (fsum, psum, n) = cells[&k];
+        if norm(fsum) > 1e-12 { ct.entry(k.0).or_default().push((normalize(psum), scale(fsum, 1.0))); let _ = n; }
+    }
+    w.cell_tractions = ct;
 
     for a in 0..np {
         if !w.plates[a].alive { continue; }

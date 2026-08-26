@@ -114,7 +114,7 @@ pub fn export(w: &World) {
     std::fs::write(format!("{}/boundaries_0Ma.gmt", dir), gmt).expect("gmt");
 
     // ---- raster sequences: time-named copies ----
-    for layer in ["elev", "plates", "age", "bounds"] {
+    for layer in ["elev", "plates", "age", "bounds", "stress"] {
         let ldir = format!("{}/rasters/{}", dir, layer);
         let _ = std::fs::create_dir_all(&ldir);
         for (t, _) in &w.rot_hist {

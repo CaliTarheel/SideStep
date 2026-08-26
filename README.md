@@ -72,6 +72,7 @@ Other seeds / sizes:
   - `elev_<W>x<H>_f32le.raw` — raw little-endian float32 elevation in metres, row-major, lon −180→180 left→right, lat 90→−90 top→bottom. This is the hand-off for regridding to a GCM grid.
   - `plates.png` — plate IDs (continents bright, oceans dark, boundaries black)
   - `age.png` — oceanic crust age (bright = young), continents brown
+  - `stress.png` — intraplate tension (hot colours = corridors where opposing boundary pulls stretch a plate)
   - `bounds.png` — classified plate boundaries on a muted relief: red trench (subducting side) / amber arc (upper plate), magenta continental collision, green oceanic ridge, cyan continental rift, white transform; purple = suture younger than 100 Myr, yellow = active hotspot. Pixel counts per class are in `meta.json`.
   - `meta.json`
 - `montage_<layer>.png` — from the `montage` tool
@@ -135,7 +136,9 @@ arcs, back-arc basins, cratonic highs and textured sea floor.
 Subduction initiates only after compression builds (old passive margins, exhausted shortening
 budget, or next to an existing trench); rifts nucleate at weaknesses and propagate along them
 before splitting a plate; old slabs roll back and open back-arc basins behind detached arcs;
-sea level is eustatic; rendered elevation carries tectonically-modulated sub-parcel detail.
+sea level is eustatic; rendered elevation carries tectonically-modulated sub-parcel detail;
+rifting is driven by a spatially resolved intraplate stress field (opposing boundary pulls with
+relief near open rifts — the `stress` viewer layer shows it) instead of a per-plate clock.
 The crust cycle is closed: eroded volume returns as prograding shelf at continental margins,
 and continental fraction holds flat over a Gyr at 160K+ parcels (mild upward drift at 40K).
 Plate speeds agree across resolutions (boundary forces are normalised by smoothed boundary
