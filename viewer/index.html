@@ -51,10 +51,11 @@
     <button data-layer="stress">Stress</button>
   </div>
   <label class="chk"><input type="checkbox" id="spin"> auto-rotate</label>
+  <label class="chk"><input type="checkbox" id="plabels"> plate ids</label>
   <label class="chk"><input type="checkbox" id="light" checked> shading</label>
   <div id="stats"></div>
 </div>
-<div id="help">drag: rotate/pan · wheel: zoom · m: globe/map · ←/→: step · space: play · click chart: jump</div>
+<div id="help">drag: rotate/pan · wheel: zoom · click: identify plate · m: globe/map · ←/→: step · space: play · click chart: jump</div>
 <div id="bkey" style="display:none">
   <b>Boundaries</b>
   <span><i style="background:#ff3b30"></i>trench (subducting side)</span>
@@ -68,6 +69,8 @@
 </div>
 <div id="load"></div>
 <div id="coords" style="position:absolute; right:12px; bottom:140px; color:var(--dim); font-size:11px; font-variant-numeric:tabular-nums;"></div>
+<div id="pinfo" style="display:none; position:absolute; left:12px; top:46px; background:rgba(21,25,35,.94); border:1px solid var(--line); border-radius:8px; padding:8px 12px; font-size:12px; max-width:260px;"></div>
+<div id="plateLabels" style="position:absolute; inset:0; pointer-events:none; overflow:hidden;"></div>
 <div id="bottom">
   <div id="row">
     <button id="play" title="play / pause">▶</button>
@@ -82,7 +85,7 @@
 <script>
 'use strict';
 // ---------- data ----------
-const state = { times: [], idx: 0, layer: 'elev', playing: false, speed: 30, log: new Map(), events: [], tex: new Map(), pending: new Set(), spin: false, light: true, mode: 'globe', map: { cx: 0.5, cy: 0.5, zoom: 1 } };
+const state = { times: [], idx: 0, layer: 'elev', playing: false, speed: 30, log: new Map(), events: [], tex: new Map(), pending: new Set(), spin: false, light: true, mode: 'globe', map: { cx: 0.5, cy: 0.5, zoom: 1 }, plabels: false, sel: null, pmeta: null };
 const $ = id => document.getElementById(id);
 
 async function loadIndex() {
@@ -199,6 +202,7 @@ $('time').addEventListener('change', () => preloadAround(state.idx));
 $('play').addEventListener('click', togglePlay);
 $('speed').addEventListener('change', e => state.speed = +e.target.value);
 $('spin').addEventListener('change', e => state.spin = e.target.checked);
+$('plabels').addEventListener('change', e => { state.plabels = e.target.checked; if (state.plabels) ensurePlateData(state.times[state.idx]); });
 $('light').addEventListener('change', e => state.light = e.target.checked);
 for (const b of $('layers').querySelectorAll('button')) b.addEventListener('click', () => {
   for (const o of $('layers').querySelectorAll('button')) o.classList.remove('on');
@@ -218,8 +222,186 @@ window.addEventListener('keydown', e => {
   else if (e.code === 'ArrowLeft') { setIdx(state.idx - 1); }
   else if (e.code === 'Home') { setIdx(0); }
   else if (e.code === 'End') { setIdx(state.times.length - 1); }
+  else if (e.code === 'Escape') { $('pinfo').style.display = 'none'; state.sel = null; }
   else if (e.code === 'KeyM') { $('modeseg').querySelector(state.mode === 'globe' ? '[data-mode="map"]' : '[data-mode="globe"]').click(); }
 });
+
+// ---------- plate identification ----------
+// Invert the engine's deterministic plate colours: continental full colour, oceanic x0.55.
+const plateTable = (() => {
+  const t = new Map();
+  for (let id = 0; id < 2048; id++) {
+    const h = ((id * 0.6180339887) % 1) * 6;
+    const sat = 0.55 + 0.3 * ((id * 7919) % 3) / 2;
+    const val = 0.9, c = val * sat;
+    const xx = c * (1 - Math.abs((h % 2) - 1));
+    let r, g, b;
+    switch (Math.trunc(h)) { case 0: [r,g,b]=[c,xx,0]; break; case 1: [r,g,b]=[xx,c,0]; break; case 2: [r,g,b]=[0,c,xx]; break; case 3: [r,g,b]=[0,xx,c]; break; case 4: [r,g,b]=[xx,0,c]; break; default: [r,g,b]=[c,0,xx]; }
+    const m = val - c;
+    const R = Math.trunc((r + m) * 255), G = Math.trunc((g + m) * 255), B = Math.trunc((b + m) * 255);
+    const kc = (R << 16) | (G << 8) | B, ko = (Math.trunc(R * 0.55) << 16) | (Math.trunc(G * 0.55) << 8) | Math.trunc(B * 0.55);
+    if (!t.has(kc)) t.set(kc, { id, cont: true });
+    if (!t.has(ko)) t.set(ko, { id, cont: false });
+  }
+  return t;
+})();
+
+const pdata = { t: null, w: 0, h: 0, data: null, labels: [], loading: false };
+function ensurePlateData(t, done) {
+  if (pdata.t === t && pdata.data) { if (done) done(); return; }
+  if (pdata.loading) return;
+  pdata.loading = true;
+  const img = new Image();
+  img.onload = () => {
+    const cv = document.createElement('canvas');
+    cv.width = img.naturalWidth; cv.height = img.naturalHeight;
+    const ctx = cv.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(img, 0, 0);
+    const id_ = ctx.getImageData(0, 0, cv.width, cv.height);
+    pdata.t = t; pdata.w = cv.width; pdata.h = cv.height; pdata.data = id_.data;
+    computeLabels();
+    pdata.loading = false;
+    if (done) done();
+  };
+  img.onerror = () => { pdata.loading = false; };
+  img.src = '/data/t' + pad5(t) + '/plates.png';
+}
+function plateAtPixel(px, py) {
+  const { w, h, data } = pdata;
+  if (!data) return null;
+  for (let rad = 0; rad <= 4; rad++) {           // step off boundary-line pixels
+    for (let dy = -rad; dy <= rad; dy++) for (let dx = -rad; dx <= rad; dx++) {
+      if (Math.max(Math.abs(dx), Math.abs(dy)) !== rad) continue;
+      const x = ((px + dx) % w + w) % w, y = Math.max(0, Math.min(h - 1, py + dy));
+      const o = (y * w + x) * 4;
+      const hit = plateTable.get((data[o] << 16) | (data[o + 1] << 8) | data[o + 2]);
+      if (hit) return hit;
+    }
+  }
+  return null;
+}
+// label anchor per plate: centroid of its densest coarse-grid cell (stays inside C and S shapes)
+function computeLabels() {
+  const { w, h, data } = pdata;
+  const GX = 96, GY = 48;
+  const cells = new Map(); const totals = new Map();
+  const step = Math.max(1, Math.round(w / 1024));
+  for (let y = 0; y < h; y += step) for (let x = 0; x < w; x += step) {
+    const o = (y * w + x) * 4;
+    const hit = plateTable.get((data[o] << 16) | (data[o + 1] << 8) | data[o + 2]);
+    if (!hit) continue;
+    totals.set(hit.id, (totals.get(hit.id) || 0) + 1);
+    const key = hit.id * 100000 + (Math.trunc(y * GY / h) * GX + Math.trunc(x * GX / w));
+    let c = cells.get(key);
+    if (!c) { c = [0, 0, 0]; cells.set(key, c); }
+    c[0]++; c[1] += x; c[2] += y;
+  }
+  const best = new Map();
+  for (const [key, c] of cells) {
+    const id = Math.trunc(key / 100000);
+    const b = best.get(id);
+    if (!b || c[0] > b[0]) best.set(id, c);
+  }
+  const all = [...totals.values()].reduce((a, b) => a + b, 0);
+  pdata.labels = [];
+  for (const [id, tot] of totals) {
+    if (tot / all < 0.001) continue;
+    const b = best.get(id);
+    pdata.labels.push({ id, share: tot / all, u: (b[1] / b[0]) / w, v: 1 - (b[2] / b[0]) / h });
+  }
+  rebuildLabelDivs();
+}
+function rebuildLabelDivs() {
+  const host = $('plateLabels');
+  host.innerHTML = '';
+  for (const l of pdata.labels) {
+    const d = document.createElement('div');
+    d.textContent = 100 + l.id;
+    d.style.cssText = 'position:absolute; transform:translate(-50%,-50%); font:600 11px system-ui; color:#fff; text-shadow:0 0 3px #000,0 0 3px #000,0 1px 2px #000; display:none;';
+    d.dataset.id = l.id;
+    host.appendChild(d);
+    l.div = d;
+  }
+}
+function updateLabels(eye, projM, viewM) {
+  const on = state.plabels && pdata.t === state.times[state.idx] && pdata.labels.length;
+  const W = canvas.clientWidth, H = canvas.clientHeight;
+  for (const l of pdata.labels) {
+    if (!l.div) continue;
+    if (!on) { l.div.style.display = 'none'; continue; }
+    let x, y, vis = true;
+    if (state.mode === 'map') {
+      const sp = mapSpan(W, H);
+      let du = l.u - state.map.cx; du -= Math.round(du);        // wrap to nearest copy
+      x = (du / sp[0] + 0.5) * W;
+      y = (1 - (0.5 + (l.v - state.map.cy) / sp[1])) * H;
+      vis = x > -40 && x < W + 40 && y > -20 && y < H + 20;
+    } else {
+      const lon = (l.u - 0.5) * 2 * Math.PI, lat = (l.v - 0.5) * Math.PI;
+      const p = [Math.cos(lat) * Math.cos(lon), Math.sin(lat), Math.cos(lat) * Math.sin(lon)];
+      if (dot(p, [eye[0] - p[0], eye[1] - p[1], eye[2] - p[2]]) <= 0) vis = false;
+      else {
+        const vx = viewM[0]*p[0]+viewM[4]*p[1]+viewM[8]*p[2]+viewM[12];
+        const vy = viewM[1]*p[0]+viewM[5]*p[1]+viewM[9]*p[2]+viewM[13];
+        const vz = viewM[2]*p[0]+viewM[6]*p[1]+viewM[10]*p[2]+viewM[14];
+        const cx = projM[0]*vx, cy = projM[5]*vy, cw = -vz;
+        if (cw <= 0.001) vis = false;
+        else { x = (cx/cw*0.5+0.5)*W; y = (0.5-cy/cw*0.5)*H; }
+      }
+    }
+    if (!vis) { l.div.style.display = 'none'; continue; }
+    l.div.style.display = 'block';
+    l.div.style.left = x + 'px';
+    l.div.style.top = y + 'px';
+    l.div.style.color = state.sel && state.sel.id === l.id ? '#5cc8ff' : '#fff';
+  }
+}
+function identifyAt(lat, lon) {
+  const t = state.times[state.idx];
+  ensurePlateData(t, () => {
+    const px = Math.trunc(((lon + 180) / 360) * pdata.w), py = Math.trunc(((90 - lat) / 180) * pdata.h);
+    const hit = plateAtPixel(px, py);
+    const box = $('pinfo');
+    if (!hit) { box.style.display = 'none'; state.sel = null; return; }
+    state.sel = hit;
+    const lbl = pdata.labels.find(l => l.id === hit.id);
+    let meta = '';
+    if (state.pmeta && state.pmeta.has(100 + hit.id)) {
+      const m = state.pmeta.get(100 + hit.id);
+      meta = '<br>born ' + m.born + ' Myr' + (m.died !== '' ? ' · died ' + m.died + ' Myr' : '');
+    }
+    box.innerHTML = '<b style="color:#5cc8ff">Plate ' + (100 + hit.id) + '</b>' +
+      '<br>' + (hit.cont ? 'continental' : 'oceanic') + ' crust at ' + lat.toFixed(1) + '\u00b0, ' + lon.toFixed(1) + '\u00b0' +
+      (lbl ? '<br>' + (lbl.share * 100).toFixed(1) + '% of the surface' : '') + meta +
+      '<br><span style="color:var(--dim)">click ocean/land to re-pick \u00b7 Esc to close</span>';
+    box.style.display = 'block';
+  });
+}
+fetch('/data/gplates/plates.csv').then(r => r.ok ? r.text() : null).then(txt => {
+  if (!txt) return;
+  const lines = txt.trim().split('\n');
+  const head = lines[0].split(',');
+  const gi = head.indexOf('gplates_id'), bi = head.indexOf('born_myr'), di = head.indexOf('died_myr');
+  state.pmeta = new Map();
+  for (const l of lines.slice(1)) { const f = l.split(','); state.pmeta.set(+f[gi], { born: f[bi], died: f[di] }); }
+}).catch(() => {});
+
+function globePick(clientX, clientY) {
+  const r = canvas.getBoundingClientRect();
+  const W = canvas.clientWidth, H = canvas.clientHeight, A = W / H;
+  const xn = ((clientX - r.left) / W) * 2 - 1, yn = 1 - ((clientY - r.top) / H) * 2;
+  const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+  const eye = [cam.dist * cp * Math.cos(cam.yaw), cam.dist * sp, cam.dist * cp * Math.sin(cam.yaw)];
+  const f = norm3([-eye[0], -eye[1], -eye[2]]);
+  const s = norm3(cross(f, [0, 1, 0])); const u = cross(s, f);
+  const tf = Math.tan(0.35);
+  const dir = norm3([f[0] + xn * tf * A * s[0] + yn * tf * u[0], f[1] + xn * tf * A * s[1] + yn * tf * u[1], f[2] + xn * tf * A * s[2] + yn * tf * u[2]]);
+  const b = dot(eye, dir), c = dot(eye, eye) - 1, disc = b * b - c;
+  if (disc < 0) return null;
+  const tt = -b - Math.sqrt(disc);
+  const p = [eye[0] + tt * dir[0], eye[1] + tt * dir[1], eye[2] + tt * dir[2]];
+  return [Math.asin(Math.max(-1, Math.min(1, p[1]))) * 180 / Math.PI, Math.atan2(p[2], p[0]) * 180 / Math.PI];
+}
 
 // ---------- WebGL globe ----------
 const canvas = $('gl');
@@ -293,7 +475,20 @@ const loc = { pos: gl.getAttribLocation(prog, 'aPos'), uv: gl.getAttribLocation(
 // camera
 const cam = { yaw: 0.6, pitch: 0.35, dist: 2.7 };
 let dragging = false, lx = 0, ly = 0;
-canvas.addEventListener('mousedown', e => { dragging = true; lx = e.clientX; ly = e.clientY; canvas.classList.add('drag'); });
+let downX = 0, downY = 0;
+canvas.addEventListener('mousedown', e => { dragging = true; lx = e.clientX; ly = e.clientY; downX = e.clientX; downY = e.clientY; canvas.classList.add('drag'); });
+canvas.addEventListener('mouseup', e => {
+  if (Math.hypot(e.clientX - downX, e.clientY - downY) >= 5) return;   // it was a drag
+  let ll = null;
+  if (state.mode === 'map') {
+    const W = canvas.clientWidth, H = canvas.clientHeight, r = canvas.getBoundingClientRect();
+    const sp = mapSpan(W, H);
+    const u = state.map.cx + ((e.clientX - r.left) / W - 0.5) * sp[0];
+    const v = state.map.cy + (0.5 - (e.clientY - r.top) / H) * sp[1];
+    if (v >= 0 && v <= 1) ll = [(v - 0.5) * 180, ((u % 1 + 1) % 1 - 0.5) * 360];
+  } else { ll = globePick(e.clientX, e.clientY); }
+  if (ll) identifyAt(ll[0], ll[1]);
+});
 window.addEventListener('mouseup', () => { dragging = false; canvas.classList.remove('drag'); });
 window.addEventListener('mousemove', e => {
   if (state.mode === 'map') {
@@ -378,6 +573,8 @@ function frame(now) {
     if (tex2) { gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tex2); }
     gl.drawArrays(gl.TRIANGLES, 0, 6);
     gl.disableVertexAttribArray(mapLoc.q);
+    if (state.plabels) ensurePlateData(state.times[state.idx]);
+    updateLabels(null, null, null);
     requestAnimationFrame(frame);
     return;
   }
@@ -387,14 +584,17 @@ function frame(now) {
   gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, state.sphere.ib);
   const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
   const eye = [cam.dist * cp * Math.cos(cam.yaw), cam.dist * sp, cam.dist * cp * Math.sin(cam.yaw)];
-  gl.uniformMatrix4fv(loc.proj, false, new Float32Array(perspective(0.7, W / H, 0.05, 50)));
-  gl.uniformMatrix4fv(loc.view, false, new Float32Array(lookAt(eye)));
+  const projArr = perspective(0.7, W / H, 0.05, 50), viewArr = lookAt(eye);
+  gl.uniformMatrix4fv(loc.proj, false, new Float32Array(projArr));
+  gl.uniformMatrix4fv(loc.view, false, new Float32Array(viewArr));
   gl.uniformMatrix4fv(loc.model, false, new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]));
   // headlight offset up-left of the camera
   const right = norm3(cross(norm3(eye), [0, 1, 0]));
   const light = norm3([eye[0] - right[0] * 1.2 + 0.6, eye[1] + 1.0, eye[2] - right[2] * 1.2]);
   gl.uniform3fv(loc.light, new Float32Array(light));
   gl.uniform1f(loc.shade, state.light ? 1 : 0);
+  if (state.plabels) ensurePlateData(state.times[state.idx]);
+  updateLabels(eye, projArr, viewArr);
   const t = state.times[state.idx];
   let tex = state.tex.get(texKey(t, state.layer));
   if (!tex) { // fall back to nearest loaded slice of this layer so scrubbing never goes black
