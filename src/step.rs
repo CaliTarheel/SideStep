@@ -343,7 +343,7 @@ fn fill_gaps(w: &mut World) {
         placed.push(g);
         w.parcels.push(Parcel {
             pos: g, plate: pl, kind: Kind::Oceanic, birth: t, thick: 7.0, volc: 0.0,
-            trench_t: NEVER, suture_t: NEVER, hot_t: NEVER, arc_t: NEVER, rift_t: NEVER, stress: 0.0, trench_w: 0.0, alive: true,
+            trench_t: NEVER, suture_t: NEVER, hot_t: NEVER, arc_t: NEVER, rift_t: NEVER, stress: 0.0, amp: 1.0, trench_w: 0.0, alive: true,
         });
     }
     w.stats.created = placed.len();
@@ -590,25 +590,74 @@ fn rifting(w: &mut World) {
     {
         let ct = &w.cell_tractions;
         let plates = &w.plates;
-        let stresses: Vec<f32> = w.parcels.par_iter().map(|pc| {
-            if !pc.alive || pc.kind != Kind::Continental { return 0.0; }
-            let Some(cells) = ct.get(&pc.plate) else { return 0.0; };
-            if !plates[pc.plate as usize].alive { return 0.0; }
+        let hash = &w.hash;
+        let parcels = &w.parcels;
+        let s_sp = w.s;
+        let step_m = 1.2 * w.s;
+        let half_max = w.km(3000.0) / 2.0;
+        let w_ref = w.km(w.p.width_ref_km);
+        let amp_max = w.p.width_amp_max;
+        let th_gate = w.p.rift_threshold / (2.0 * w.p.width_amp_max);
+        let stresses: Vec<(f32, f32)> = (0..w.parcels.len()).into_par_iter().map(|i| {
+            let pc = &parcels[i];
+            if !pc.alive { return (0.0, 1.0); }
+            let Some(cells) = ct.get(&pc.plate) else { return (0.0, 1.0); };
+            if !plates[pc.plate as usize].alive { return (0.0, 1.0); }
             let (mut pull, mut net) = (0.0, [0.0; 3]);
+            let mut mten = [[0.0f64; 3]; 3];
             for &(cp, cf) in cells {
                 let wgt = (-dist(cp, pc.pos) / l).exp();
                 let u = tangent_toward(pc.pos, cp);
                 let along = dot(cf, u);
-                if along > 0.0 { pull += along * wgt; }
+                if along > 0.0 {
+                    pull += along * wgt;
+                    let wp = along * wgt;
+                    for a2 in 0..3 { for b2 in 0..3 { mten[a2][b2] += wp * u[a2] * u[b2]; } }
+                }
                 net = add(net, scale(cf, wgt));
             }
             let mut t_val = (pull - beta * norm(net)).max(0.0) * 1.0e4;
+            if t_val <= 0.0 { return (0.0, 1.0); }
             let mut relieved = false;
-            relief.query(pc.pos, r_relief, |k| { if !relieved && k == pc.plate && true { relieved = true; } });
+            relief.query(pc.pos, r_relief, |k| { if !relieved && k == pc.plate { relieved = true; } });
             if relieved { t_val *= 0.15; }
-            t_val as f32
+            // Constriction amplification: stress = transmitted force / load-bearing width. The tension
+            // axis is the principal direction of the opposing-pull tensor; the plate's width is marched
+            // perpendicular to it. A 300 km neck carrying the pull of a 1500 km section feels 5x.
+            if t_val >= th_gate {
+                let e1 = any_tangent(pc.pos);
+                let e2 = cross(pc.pos, e1);
+                let mv = |v: V3| mat_apply(mten, v);
+                let (m11, m12, m22) = (dot(e1, mv(e1)), dot(e1, mv(e2)), dot(e2, mv(e2)));
+                let th2 = 0.5 * (2.0 * m12).atan2(m11 - m22);
+                let ax = normalize(add(scale(e1, th2.cos()), scale(e2, th2.sin())));
+                let wdir = normalize(cross(pc.pos, ax));
+                let mut width = step_m;
+                for sgn in [1.0f64, -1.0] {
+                    let mut q = pc.pos;
+                    let mut d = scale(wdir, sgn);
+                    let mut acc = 0.0;
+                    while acc < half_max {
+                        q = move_along(q, d, step_m);
+                        d = normalize(sub(d, scale(q, dot(d, q))));
+                        let mut on = false;
+                        hash.query(q, 1.2 * s_sp, |k| {
+                            if on { return; }
+                            let pk = &parcels[k as usize];
+                            if pk.alive && pk.plate == pc.plate && dist(pk.pos, q) < 1.2 * s_sp { on = true; }
+                        });
+                        if !on { break; }
+                        acc += step_m;
+                    }
+                    width += acc;
+                }
+                let amp = (w_ref / width).clamp(1.0, amp_max);
+                t_val *= amp;
+                return (t_val as f32, amp as f32);
+            }
+            (t_val as f32, 1.0)
         }).collect();
-        let mut vals: Vec<f32> = stresses.iter().copied().filter(|&v| v > 0.0).collect();
+        let mut vals: Vec<f32> = stresses.iter().map(|&(v, _)| v).filter(|&v| v > 0.0).collect();
         vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
         if !vals.is_empty() {
             let q = |f: f64| vals[((vals.len() - 1) as f64 * f) as usize];
@@ -616,7 +665,7 @@ fn rifting(w: &mut World) {
             w.stats.stress_p95 = q(0.95);
             w.stats.stress_max = *vals.last().unwrap();
         }
-        for (pc, st) in w.parcels.iter_mut().zip(stresses) { pc.stress = st; }
+        for (pc, (st, am)) in w.parcels.iter_mut().zip(stresses) { pc.stress = st; pc.amp = am; }
     }
     // Nucleation: anywhere tension exceeds local strength, up to 3 simultaneous rifts per plate,
     // not within ~15 degrees of an active rift.
@@ -624,14 +673,20 @@ fn rifting(w: &mut World) {
     let n_min = 150.0 * w.n_scale;
     let p_nuc = (w.p.rift_rate * w.p.stress_every).min(0.9);
     for a in 0..np {
-        if !w.plates[a].alive || (w.plates[a].n_cont as f64) < n_min { continue; }
+        if !w.plates[a].alive || (w.plates[a].n as f64) < 2.0 * n_min { continue; }
         let n_active = w.rifts.iter().filter(|r| r.plate == a as u32).count();
         if n_active >= 3 { continue; }
-        // best candidate parcel by tension / strength
+        // best candidate parcel by tension / strength; oceanic lithosphere is stronger and carries
+        // no inherited weaknesses, but a stressed neck can still break (an instant ridge/transform).
         let mut best: Option<(usize, f64)> = None;
         for (i, pc) in w.parcels.iter().enumerate() {
-            if !pc.alive || pc.plate != a as u32 || pc.kind != Kind::Continental || pc.stress <= 0.0 { continue; }
-            let sc = pc.stress as f64 * (1.0 + weakness_at(w, pc.pos));
+            if !pc.alive || pc.plate != a as u32 || pc.stress <= 0.0 { continue; }
+            let sc = if pc.kind == Kind::Continental {
+                pc.stress as f64 * (1.0 + weakness_at(w, pc.pos))
+            } else if pc.amp >= 2.0 {
+                // oceanic lithosphere only fails at a genuine constriction
+                pc.stress as f64 / w.p.ocean_strength
+            } else { continue };
             if best.map_or(true, |(_, bs)| sc > bs) { best = Some((i, sc)); }
         }
         let Some((i, sc)) = best else { continue };
@@ -639,9 +694,43 @@ fn rifting(w: &mut World) {
         let c = w.parcels[i].pos;
         if w.rifts.iter().any(|r| r.plate == a as u32 && angle(r.nucleus, c) < 0.5) { continue; }
         if w.rng.gen::<f64>() < p_nuc {
-            nucleate_rift_at(w, a, i);
+            if w.parcels[i].kind == Kind::Continental { nucleate_rift_at(w, a, i); }
+            else if snap_neck(w, a, i) { w.stats.rifts += 1; }
         }
     }
+}
+
+/// Tension axis at a parcel (principal direction of the opposing-pull tensor).
+fn tension_axis_at(w: &World, i: usize) -> Option<V3> {
+    let pc = &w.parcels[i];
+    let cells = w.cell_tractions.get(&pc.plate)?;
+    let l = w.km(w.p.stress_l_km);
+    let mut mten = [[0.0f64; 3]; 3];
+    for &(cp, cf) in cells {
+        let wgt = (-dist(cp, pc.pos) / l).exp();
+        let u = tangent_toward(pc.pos, cp);
+        let along = dot(cf, u);
+        if along > 0.0 { let wp = along * wgt; for a in 0..3 { for b in 0..3 { mten[a][b] += wp * u[a] * u[b]; } } }
+    }
+    let e1 = any_tangent(pc.pos);
+    let e2 = cross(pc.pos, e1);
+    let mv = |v: V3| mat_apply(mten, v);
+    let (m11, m12, m22) = (dot(e1, mv(e1)), dot(e1, mv(e2)), dot(e2, mv(e2)));
+    if m11 + m22 < 1e-18 { return None; }
+    let th2 = 0.5 * (2.0 * m12).atan2(m11 - m22);
+    Some(normalize(add(scale(e1, th2.cos()), scale(e2, th2.sin()))))
+}
+
+/// An overstressed oceanic constriction snaps: a straight cut ACROSS the neck (along the width
+/// direction, the shortest way to the boundary on both sides) splits the plate at once. This is a
+/// plate-reorganisation event: the new boundary is born as a ridge/transform pair. The cut is
+/// deliberately NOT steered toward existing boundaries - steering is what shaved off ribbon plates.
+fn snap_neck(w: &mut World, a: usize, i: usize) -> bool {
+    let Some(ax) = tension_axis_at(w, i) else { return false };
+    let c = w.parcels[i].pos;
+    let wdir = normalize(cross(c, ax));
+    let r = ActiveRift { plate: a as u32, nucleus: c, normal: ax, path: vec![c], tip: [c, c], dir: [wdir, scale(wdir, -1.0)], done: [true, true], born: w.t };
+    split_along_straight(w, &r)
 }
 
 /// Start a rift at a specific parcel, running perpendicular to the plate's motion there.
@@ -750,16 +839,20 @@ fn advance_rifts(w: &mut World) {
 
 /// Split plate `r.plate` along the rift path (extended straight through any oceanic crust to the plate
 /// edge). The smaller side becomes a new plate and the halves are pushed apart.
-fn split_along(w: &mut World, r: &ActiveRift) -> bool {
+fn split_along(w: &mut World, r: &ActiveRift) -> bool { split_along_impl(w, r, true) }
+fn split_along_straight(w: &mut World, r: &ActiveRift) -> bool { split_along_impl(w, r, false) }
+fn split_along_impl(w: &mut World, r: &ActiveRift, steer: bool) -> bool {
     let a = r.plate as usize;
     let s = w.s;
     let t = w.t;
     let mut path = r.path.clone();
     // this plate's current boundary parcels: the extension through the ocean steers toward the nearest
     // one, so the cut takes the shortest plausible route to an existing boundary (a transform link)
-    let bnd: Vec<V3> = w.parcels.iter().enumerate()
-        .filter(|(i, pc)| pc.alive && pc.plate == a as u32 && matches!(w.binfo.get(*i), Some(Some(b)) if b.dist < 1.5 * s))
-        .map(|(_, pc)| pc.pos).collect();
+    let bnd: Vec<V3> = if steer {
+        w.parcels.iter().enumerate()
+            .filter(|(i, pc)| pc.alive && pc.plate == a as u32 && matches!(w.binfo.get(*i), Some(Some(b)) if b.dist < 1.5 * s))
+            .map(|(_, pc)| pc.pos).collect()
+    } else { vec![] };
     for e in 0..2 {
         let mut p = r.tip[e];
         let mut d = r.dir[e];
@@ -933,10 +1026,7 @@ fn backarc(w: &mut World) {
                 });
             }
         }
-        let n_cont_arc = { let mut c = 0; { let hash = &w.hash; let parcels = &w.parcels; let r_arc2 = w.km(w.p.backarc_km); for &q in pts.iter().step_by(4) { hash.query(q, r_arc2, |k| { let pk = &parcels[k as usize]; if pk.alive && pk.plate == upper && pk.kind == Kind::Continental && dist(pk.pos, q) < r_arc2 { c += 1; } }); } } c };
-        let tension_ok = if n_cont_arc * 5 >= n_st.max(1) {
-            n_st > 0 && st / n_st as f64 >= w.p.backarc_stress * w.p.rift_threshold
-        } else { true }; // intra-oceanic arcs carry no stress field; the age gate alone applies
+        let tension_ok = n_st > 0 && st / n_st as f64 >= w.p.backarc_stress * w.p.rift_threshold;
         if !tension_ok { continue; }
         if w.rng.gen::<f64>() >= w.p.rollback_rate * dt { continue; }
         cands.push(((lower, upper), pts));

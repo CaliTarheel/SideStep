@@ -35,6 +35,8 @@ pub struct Parcel {
     pub rift_t: f64,
     /// Intraplate tension proxy (opposing boundary pulls), updated every `stress_every` Myr.
     pub stress: f32,
+    /// Constriction amplification that went into `stress` (1 = full-width plate, >1 = neck).
+    pub amp: f32,
     /// Flexural deepening weight (1 at the trench, 0 at the outer edge of the flexural bulge).
     pub trench_w: f64,
     pub alive: bool,
@@ -141,6 +143,12 @@ pub struct Params {
     pub stress_beta: f64,
     /// Arc parcels need this much tension (x rift_threshold) to detach for rollback.
     pub backarc_stress: f64,
+    /// Oceanic lithosphere is this many times stronger than continental against rifting.
+    pub ocean_strength: f64,
+    /// Reference load-bearing width (km): stress amplifies by width_ref/width at constrictions.
+    pub width_ref_km: f64,
+    /// Cap on the constriction amplification.
+    pub width_amp_max: f64,
     /// Resistance at a convergent contact that has no subduction zone yet (per unit length).
     pub k_resist: f64,
     /// Oceanic lithosphere this old (Myr) can start subducting after a little compression.
@@ -188,7 +196,7 @@ impl Params {
         Params {
             seed: 42, n_parcels: 40_000, n_plates: 12, years: 1000.0, dt: 1.0, slice_every: 10.0,
             width: 1024, out: "out/run".into(), cont_frac: 0.30, n_hotspots: 12,
-            k_slab: 0.015, k_ridge: 0.004, k_coll: 0.2, k_suction: 0.003, k_rift: 0.012, rift_push_myr: 60.0, rift_prop_v: 150.0, stress_every: 2.0, stress_l_km: 4000.0, stress_beta: 0.6, backarc_stress: 0.5, k_resist: 0.05, init_age: 60.0, init_short: 150.0, lock_km: 500.0, virus_km: 600.0, rollback_age: 80.0, rollback_rate: 0.012, backarc_km: 300.0, backarc_myr: 40.0, rollback_v: 30.0, detail: true, drag_ocean: 1.0, drag_cont: 3.0,
+            k_slab: 0.015, k_ridge: 0.004, k_coll: 0.2, k_suction: 0.003, k_rift: 0.012, rift_push_myr: 60.0, rift_prop_v: 150.0, stress_every: 2.0, stress_l_km: 4000.0, stress_beta: 0.6, backarc_stress: 0.05, ocean_strength: 2.0, width_ref_km: 1500.0, width_amp_max: 6.0, k_resist: 0.05, init_age: 60.0, init_short: 150.0, lock_km: 500.0, virus_km: 600.0, rollback_age: 80.0, rollback_rate: 0.012, backarc_km: 300.0, backarc_myr: 40.0, rollback_v: 30.0, detail: true, drag_ocean: 1.0, drag_cont: 3.0,
             v_max: 200.0, omega_relax: 0.5,
             rift_threshold: 20.0, rift_rate: 0.04,
             arc_rate: 0.04, hot_rate: 2.0, erosion_tau: 40.0, volc_tau: 60.0,
@@ -231,6 +239,9 @@ impl Params {
                 "stress-l-km" => p.stress_l_km = f(),
                 "stress-beta" => p.stress_beta = f(),
                 "backarc-stress" => p.backarc_stress = f(),
+                "ocean-strength" => p.ocean_strength = f(),
+                "width-ref-km" => p.width_ref_km = f(),
+                "width-amp-max" => p.width_amp_max = f(),
                 "k-resist" => p.k_resist = f(),
                 "init-age" => p.init_age = f(),
                 "init-short" => p.init_short = f(),
@@ -397,7 +408,7 @@ impl World {
                 }
             }
             let birth = if kind == Kind::Continental { -3000.0 } else { -(70.0 + 60.0 * age_noise.eval(pos)).clamp(2.0, 160.0) };
-            parcels.push(Parcel { pos, plate: best.0, kind, birth, thick, volc: 0.0, trench_t: NEVER, suture_t: NEVER, hot_t: NEVER, arc_t: NEVER, rift_t: NEVER, stress: 0.0, trench_w: 0.0, alive: true });
+            parcels.push(Parcel { pos, plate: best.0, kind, birth, thick, volc: 0.0, trench_t: NEVER, suture_t: NEVER, hot_t: NEVER, arc_t: NEVER, rift_t: NEVER, stress: 0.0, amp: 1.0, trench_w: 0.0, alive: true });
         }
 
         let plates = (0..p.n_plates).map(|_| {

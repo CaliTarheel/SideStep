@@ -59,20 +59,43 @@ fn main() {
         if n > e.0 { *e = (n, sx / n as f64, sy / n as f64); }
     }
 
+    // perimeter (boundary pixels) per plate, for an isoperimetric compactness number
+    let mut perim: HashMap<u32, u64> = HashMap::new();
+    for y in 0..h {
+        for x in 0..w {
+            let p0 = img.get_pixel(x as u32, y as u32).0;
+            let Some(&(id, _)) = table.get(&p0) else { continue };
+            let mut edge = false;
+            for (dx, dy) in [(1i64, 0i64), (-1, 0), (0, 1), (0, -1)] {
+                let xx = ((x as i64 + dx).rem_euclid(w as i64)) as u32;
+                let yy = (y as i64 + dy).clamp(0, h as i64 - 1) as u32;
+                let pn = img.get_pixel(xx, yy).0;
+                match table.get(&pn) { Some(&(idn, _)) if idn == id => {}, _ => { edge = true; break; } }
+            }
+            if edge { *perim.entry(id).or_insert(0) += 1; }
+        }
+    }
     let total: u64 = count.values().map(|v| v.0).sum();
     let mut ids: Vec<(u32, u64, u64)> = count.iter().map(|(&id, &(n, nc))| (id, n, nc)).collect();
     ids.sort_by(|a, b| b.1.cmp(&a.1));
 
     let mut out = img.clone();
-    println!("{:>6} {:>7} {:>7} {:>9} {:>9}", "plate", "share%", "cont%", "label_lat", "label_lon");
+    println!("{:>6} {:>7} {:>7} {:>8} {:>9} {:>9}", "plate", "share%", "cont%", "compact", "label_lat", "label_lon");
+    let mut wsum = 0.0;
+    let mut csum = 0.0;
     for &(id, n, nc) in &ids {
         if (n as f64) / (total as f64) < 0.0005 { continue; }
         let (_, lx, ly) = best_cell[&id];
         let lat = 90.0 - (ly + 0.5) / h as f64 * 180.0;
         let lon = -180.0 + (lx + 0.5) / w as f64 * 360.0;
-        println!("{:>6} {:>7.2} {:>7.1} {:>9.1} {:>9.1}", 100 + id, n as f64 / total as f64 * 100.0, nc as f64 / n as f64 * 100.0, lat, lon);
+        let pm = perim.get(&id).copied().unwrap_or(0) as f64;
+        let compact = if pm > 0.0 { (4.0 * std::f64::consts::PI * n as f64 / (pm * pm)).min(1.0) } else { 0.0 };
+        wsum += n as f64;
+        csum += compact * n as f64;
+        println!("{:>6} {:>7.2} {:>7.1} {:>8.3} {:>9.1} {:>9.1}", 100 + id, n as f64 / total as f64 * 100.0, nc as f64 / n as f64 * 100.0, compact, lat, lon);
         draw_label(&mut out, lx as u32, ly as u32, &format!("{}", 100 + id));
     }
+    println!("area-weighted mean compactness: {:.3}", csum / wsum.max(1.0));
     let outp = format!("{}/t{:05}/plates_labeled.png", dir, t);
     out.save(&outp).expect("save labeled");
     println!("{}", outp);

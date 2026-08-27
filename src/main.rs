@@ -13,6 +13,7 @@ fn main() {
     let params = Params::from_args(std::env::args().skip(1).collect());
     std::fs::create_dir_all(&params.out).expect("create output directory");
     std::fs::write(format!("{}/params.json", params.out), params.to_json()).expect("write params.json");
+    std::fs::write(format!("{}/params_full.txt", params.out), format!("{:#?}\n", params)).expect("write params_full.txt");
     let t_init = Instant::now();
     let mut w = World::new(params);
     eprintln!(

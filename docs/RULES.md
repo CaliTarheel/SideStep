@@ -19,6 +19,18 @@ deliberately not yet) in the engine as of v0. File references are to `src/`.
 | **XI** | Sutures are long-lived weaknesses, future rifts. | `suture_t` recorded at collision contacts and block accretions; 5× weight when choosing the rift nucleus; 500 Myr memory. | done |
 | **Last** | Catastrophic, not chaotic; collision and ridge subduction are the instabilities; both lower sea level. | Collisions lock and jump abruptly; ridge subduction removes a plate and re-balances neighbours in one step. **Eustatic sea level**: ocean volume is held at its value after 100 Myr of spin-up; each slice solves for the sea level that conserves it, so young voluminous ridges raise it and collisions / ridge subduction lower it (typical swing ±250 m). All elevations are relative to that level. | done |
 
+## Constrictions (spaghetti plates)
+
+Stress lives on ALL lithosphere (oceanic is `ocean_strength` = 2x stronger and carries no inherited
+weakness), and is amplified at constrictions by `width_ref_km / width` (capped at `width_amp_max`),
+where width is marched perpendicular to the local tension axis (principal direction of the
+opposing-pull tensor). A continental neck rifts normally; an overstressed oceanic constriction
+(amplification >= 2) **snaps**: a straight cut across the neck splits the plate at once - a plate
+reorganisation whose new boundary is born as a ridge/transform pair. The cut must NOT be steered
+toward existing boundaries (steered cuts run parallel to them and shave off ribbon plates - tried,
+abandoned; area-weighted plate compactness collapsed 0.32 -> 0.16, vs 0.53 with the straight cut).
+Back-arc detachment is gated on measured tension behind the arc (`backarc_stress` x threshold).
+
 ## Failed rifts (aulacogens)
 
 Two rules added after the 160K-parcel run showed deep slots criss-crossing continents:
