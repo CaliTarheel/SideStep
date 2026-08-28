@@ -592,7 +592,8 @@ fn rifting(w: &mut World) {
         let plates = &w.plates;
         let hash = &w.hash;
         let parcels = &w.parcels;
-        let s_sp = w.s;
+        let r_on = w.reach(1.2, 130.0); // bridge parcel-scale bays: only >130 km of open water ends the march
+        let w_floor = w.km(250.0);      // parcel-scale roughness is not a neck
         let step_m = 1.2 * w.s;
         let half_max = w.km(3000.0) / 2.0;
         let w_ref = w.km(w.p.width_ref_km);
@@ -638,17 +639,17 @@ fn rifting(w: &mut World) {
                         q = move_along(q, d, step_m);
                         d = normalize(sub(d, scale(q, dot(d, q))));
                         let mut on = false;
-                        hash.query(q, 1.2 * s_sp, |k| {
+                        hash.query(q, r_on, |k| {
                             if on { return; }
                             let pk = &parcels[k as usize];
-                            if pk.alive && pk.plate == pc.plate && dist(pk.pos, q) < 1.2 * s_sp { on = true; }
+                            if pk.alive && pk.plate == pc.plate && dist(pk.pos, q) < r_on { on = true; }
                         });
                         if !on { break; }
                         acc += step_m;
                     }
                     width += acc;
                 }
-                let amp = (w_ref / width).clamp(1.0, amp_max);
+                let amp = (w_ref / width.max(w_floor)).clamp(1.0, amp_max);
                 t_val *= amp;
                 return (t_val as f32, amp as f32);
             }
@@ -685,7 +686,7 @@ fn rifting(w: &mut World) {
             if !pc.alive || pc.plate != a as u32 || pc.stress <= 0.0 { continue; }
             let mut sc = if pc.kind == Kind::Continental {
                 pc.stress as f64 * (1.0 + weakness_at(w, pc.pos))
-            } else if pc.amp >= 2.0 {
+            } else if pc.amp >= 3.0 {
                 // oceanic lithosphere only fails at a genuine constriction
                 pc.stress as f64 / w.p.ocean_strength
             } else { continue };
