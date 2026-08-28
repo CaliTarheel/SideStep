@@ -13,11 +13,11 @@ pub fn update_omegas(w: &mut World) {
     let mut slab = vec![0.0f64; np];
     let mut suction = vec![0.0f64; np];
     let area = s * s; // each parcel represents ~s^2 steradians
-    // Boundary forces act on every parcel within `band` of the other plate. Parcels are consumed at 0.8 s
-    // and created at 0.9-1.8 s, so a narrow band's occupancy flickered with each step; a 3 s band always
-    // holds ~2.2 rows, and `len` is normalised so the force per unit boundary length is the rule's value
-    // (calibrated to the 0.7-row occupancy of the original 1.5 s band) independent of dt and spacing.
-    let band = 3.0 * s;
+    // Boundary forces act on every parcel within `band` of the other plate. The band is km-fixed and
+    // equal to the detection reach: with a lattice-fixed band the number of force-carrying rows grew
+    // with resolution (200 km holds 1.8 rows at 113 km spacing but 3.6 at 56 km), which doubled the
+    // force per unit boundary length at 160K and overheated the stress field.
+    let band = w.reach(1.5, 200.0);
     let len = s * 0.55;
 
     // Normalise boundary forces by a smoothed boundary length: at fine spacing the boundary is rougher,
@@ -37,7 +37,8 @@ pub fn update_omegas(w: &mut World) {
         if b.other == pc.plate || b.dist >= band { continue; }
         *occupancy.entry((pc.plate, b.other, ckey(pc.pos))).or_insert(0.0) += 1.0;
     }
-    let expected = (cell / s) * 2.2; // contact parcels a straight boundary would put in one cell
+    // contact parcels a straight boundary puts in one cell across the whole band, at this spacing
+    let expected = (cell / s) * (band / s);
 
     for (i, pc) in w.parcels.iter().enumerate() {
         if !pc.alive { continue; }
