@@ -618,9 +618,6 @@ fn rifting(w: &mut World) {
             }
             let mut t_val = (pull - beta * norm(net)).max(0.0) * 1.0e4;
             if t_val <= 0.0 { return (0.0, 1.0); }
-            let mut relieved = false;
-            relief.query(pc.pos, r_relief, |k| { if !relieved && k == pc.plate { relieved = true; } });
-            if relieved { t_val *= 0.15; }
             // Constriction amplification: stress = transmitted force / load-bearing width. The tension
             // axis is the principal direction of the opposing-pull tensor; the plate's width is marched
             // perpendicular to it. A 300 km neck carrying the pull of a 1500 km section feels 5x.
@@ -684,12 +681,16 @@ fn rifting(w: &mut World) {
         let mut best: Option<(usize, f64)> = None;
         for (i, pc) in w.parcels.iter().enumerate() {
             if !pc.alive || pc.plate != a as u32 || pc.stress <= 0.0 { continue; }
-            let sc = if pc.kind == Kind::Continental {
+            let mut sc = if pc.kind == Kind::Continental {
                 pc.stress as f64 * (1.0 + weakness_at(w, pc.pos))
             } else if pc.amp >= 2.0 {
                 // oceanic lithosphere only fails at a genuine constriction
                 pc.stress as f64 / w.p.ocean_strength
             } else { continue };
+            // A fresh boundary nearby is already taking up the extension: no new break here.
+            let mut relieved = false;
+            relief.query(pc.pos, r_relief, |k| { if !relieved && k == pc.plate { relieved = true; } });
+            if relieved { sc *= 0.15; }
             if best.map_or(true, |(_, bs)| sc > bs) { best = Some((i, sc)); }
         }
         let Some((i, sc)) = best else { continue };
