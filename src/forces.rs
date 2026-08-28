@@ -18,7 +18,10 @@ pub fn update_omegas(w: &mut World) {
     // with resolution (200 km holds 1.8 rows at 113 km spacing but 3.6 at 56 km), which doubled the
     // force per unit boundary length at 160K and overheated the stress field.
     let band = w.reach(1.5, 200.0);
-    let len = s * 0.55;
+    // Per-parcel boundary force is AREA-scaled (like drag): F/km of boundary = 31 * k * band, which is
+    // independent of spacing. (31 = 0.55/s at the 40K reference, preserving the calibrated force scale;
+    // a length-scaled force made F/km grow ~1/s and overheated fine grids.)
+    let len = s * s * 31.0;
 
     // Normalise boundary forces by a smoothed boundary length: at fine spacing the boundary is rougher,
     // its measured length grows, and per-parcel forces would over-count. Count the contact parcels per
