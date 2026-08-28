@@ -674,8 +674,11 @@ fn rifting(w: &mut World) {
     let p_nuc = (w.p.rift_rate * w.p.stress_every).min(0.9);
     for a in 0..np {
         if !w.plates[a].alive || (w.plates[a].n as f64) < 2.0 * n_min { continue; }
+        // A young plate cannot split again at once: without this refractory a split's fragments
+        // re-split every evaluation and the system churns into interlocked shards (seed-3 mode).
+        if w.t - w.plates[a].born < 80.0 { continue; }
         let n_active = w.rifts.iter().filter(|r| r.plate == a as u32).count();
-        if n_active >= 3 { continue; }
+        if n_active >= 2 { continue; }
         // best candidate parcel by tension / strength; oceanic lithosphere is stronger and carries
         // no inherited weaknesses, but a stressed neck can still break (an instant ridge/transform).
         let mut best: Option<(usize, f64)> = None;
@@ -942,6 +945,9 @@ fn split_along_impl(w: &mut World, r: &ActiveRift, steer: bool) -> bool {
         w.parcels[i].plate = new_id;
         if w.parcels[i].kind == Kind::Continental { n_cont += 1; }
     }
+    // The cut accommodates the extension: relieve stress along it (rift_t feeds the relief field),
+    // otherwise an unseparated cut stays stressed and the plate snaps again and again into fragments.
+    for &i in &barrier { w.parcels[i].rift_t = t; }
     let om = w.plates[a].omega;
     let mv = w.plates[a].mean_v;
     w.plates.push(Plate { omega: om, alive: true, tension: 0.0, n: moved.len(), n_cont, n_weak: 0, mean_v: mv, slab: 0.0, suction: 0.0, born: t });

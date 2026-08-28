@@ -196,9 +196,9 @@ impl Params {
         Params {
             seed: 42, n_parcels: 40_000, n_plates: 12, years: 1000.0, dt: 1.0, slice_every: 10.0,
             width: 1024, out: "out/run".into(), cont_frac: 0.30, n_hotspots: 12,
-            k_slab: 0.015, k_ridge: 0.004, k_coll: 0.2, k_suction: 0.003, k_rift: 0.012, rift_push_myr: 60.0, rift_prop_v: 150.0, stress_every: 2.0, stress_l_km: 4000.0, stress_beta: 0.6, backarc_stress: 0.05, ocean_strength: 2.0, width_ref_km: 1500.0, width_amp_max: 6.0, k_resist: 0.05, init_age: 60.0, init_short: 150.0, lock_km: 500.0, virus_km: 600.0, rollback_age: 80.0, rollback_rate: 0.012, backarc_km: 300.0, backarc_myr: 40.0, rollback_v: 30.0, detail: true, drag_ocean: 1.0, drag_cont: 3.0,
+            k_slab: 0.015, k_ridge: 0.004, k_coll: 0.2, k_suction: 0.003, k_rift: 0.012, rift_push_myr: 60.0, rift_prop_v: 150.0, stress_every: 2.0, stress_l_km: 4000.0, stress_beta: 0.6, backarc_stress: 0.02, ocean_strength: 2.0, width_ref_km: 1500.0, width_amp_max: 6.0, k_resist: 0.05, init_age: 60.0, init_short: 150.0, lock_km: 500.0, virus_km: 600.0, rollback_age: 70.0, rollback_rate: 0.03, backarc_km: 300.0, backarc_myr: 40.0, rollback_v: 30.0, detail: true, drag_ocean: 1.0, drag_cont: 3.0,
             v_max: 200.0, omega_relax: 0.5,
-            rift_threshold: 20.0, rift_rate: 0.04,
+            rift_threshold: 20.0, rift_rate: 0.025,
             arc_rate: 0.04, hot_rate: 2.0, erosion_tau: 40.0, volc_tau: 60.0,
             thick_coeff: 0.015, thin_coeff: 0.011, accrete_rate: 0.01,
         }
