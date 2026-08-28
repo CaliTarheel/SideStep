@@ -679,6 +679,8 @@ fn rifting(w: &mut World) {
         // best candidate parcel by tension / strength; oceanic lithosphere is stronger and carries
         // no inherited weaknesses, but a stressed neck can still break (an instant ridge/transform).
         let mut best: Option<(usize, f64)> = None;
+        let mut over_area = 0.0; // steradians of this plate above threshold (resolution-invariant)
+        let s2 = w.s * w.s;
         for (i, pc) in w.parcels.iter().enumerate() {
             if !pc.alive || pc.plate != a as u32 || pc.stress <= 0.0 { continue; }
             let mut sc = if pc.kind == Kind::Continental {
@@ -691,13 +693,17 @@ fn rifting(w: &mut World) {
             let mut relieved = false;
             relief.query(pc.pos, r_relief, |k| { if !relieved && k == pc.plate { relieved = true; } });
             if relieved { sc *= 0.15; }
+            if sc >= w.p.rift_threshold { over_area += s2; }
             if best.map_or(true, |(_, bs)| sc > bs) { best = Some((i, sc)); }
         }
         let Some((i, sc)) = best else { continue };
         if sc < w.p.rift_threshold { continue; }
         let c = w.parcels[i].pos;
         if w.rifts.iter().any(|r| r.plate == a as u32 && angle(r.nucleus, c) < 0.5) { continue; }
-        if w.rng.gen::<f64>() < p_nuc {
+        // Failure probability scales with the overstressed AREA, not with the sample maximum -
+        // a max over 4x more parcels is statistically higher, which tripled rift rates at 160K.
+        let p_eff = (p_nuc * (over_area / w.p.rift_area_ref)).min(0.9);
+        if w.rng.gen::<f64>() < p_eff {
             if w.parcels[i].kind == Kind::Continental { nucleate_rift_at(w, a, i); }
             else if snap_neck(w, a, i) { w.stats.rifts += 1; }
         }
