@@ -1,0 +1,6 @@
+{
+  "seed": 42, "parcels": 640000, "plates": 12, "years": 1000, "dt": 0.25, "slice": 10, "width": 4096,
+  "cont_frac": 0.3, "hotspots": 12,
+  "k_slab": 0.015, "k_ridge": 0.004, "k_coll": 0.2, "k_suction": 0.003, "k_rift": 0.012, "rift_push_myr": 60, "drag_ocean": 1, "drag_cont": 3, "v_max": 200, "omega_relax": 0.5,
+  "rift_threshold": 20, "rift_rate": 0.025, "arc_rate": 0.04, "hot_rate": 2, "erosion_tau": 40, "volc_tau": 60, "thick_coeff": 0.015, "thin_coeff": 0.011, "accrete_rate": 0.01
+}
