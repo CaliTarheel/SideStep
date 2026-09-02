@@ -99,6 +99,8 @@ pub struct Stats {
     pub retired: usize,
     pub dissolved: usize,
     pub deposited: usize,
+    pub split_off: usize,
+    pub enclaves: usize,
     pub stress_p50: f32,
     pub stress_p95: f32,
     pub stress_max: f32,
@@ -182,6 +184,9 @@ pub struct Params {
     pub rift_rate: f64,
     /// Overstressed area (steradians) at which the nucleation rate reaches rift_rate.
     pub rift_area_ref: f64,
+    /// Plates covering more than this fraction of the surface can fail without a constriction
+    /// (broad oceanic breakup / ridge jump), at extra strength.
+    pub mega_frac: f64,
     // --- crust evolution ---
     pub arc_rate: f64,
     pub hot_rate: f64,
@@ -200,7 +205,7 @@ impl Params {
             width: 1024, out: "out/run".into(), cont_frac: 0.30, n_hotspots: 12,
             k_slab: 0.015, k_ridge: 0.004, k_coll: 0.2, k_suction: 0.003, k_rift: 0.012, rift_push_myr: 60.0, rift_prop_v: 150.0, stress_every: 2.0, stress_l_km: 4000.0, stress_beta: 0.6, backarc_stress: 0.02, ocean_strength: 2.0, width_ref_km: 1500.0, width_amp_max: 6.0, k_resist: 0.05, init_age: 60.0, init_short: 150.0, lock_km: 500.0, virus_km: 600.0, rollback_age: 70.0, rollback_rate: 0.03, backarc_km: 300.0, backarc_myr: 40.0, rollback_v: 30.0, detail: true, drag_ocean: 1.0, drag_cont: 3.0,
             v_max: 200.0, omega_relax: 0.5,
-            rift_threshold: 20.0, rift_rate: 0.025, rift_area_ref: 0.005,
+            rift_threshold: 20.0, rift_rate: 0.025, rift_area_ref: 0.005, mega_frac: 0.25,
             arc_rate: 0.04, hot_rate: 2.0, erosion_tau: 40.0, volc_tau: 60.0,
             thick_coeff: 0.015, thin_coeff: 0.011, accrete_rate: 0.01,
         }
@@ -262,6 +267,7 @@ impl Params {
                 "rift-threshold" => p.rift_threshold = f(),
                 "rift-rate" => p.rift_rate = f(),
                 "rift-area-ref" => p.rift_area_ref = f(),
+                "mega-frac" => p.mega_frac = f(),
                 "arc-rate" => p.arc_rate = f(),
                 "hot-rate" => p.hot_rate = f(),
                 "erosion-tau" => p.erosion_tau = f(),
@@ -337,6 +343,8 @@ pub struct World {
     pub cell_tractions: HashMap<u32, Vec<(V3, V3)>>,
     /// Last time the stress field was evaluated.
     pub stress_eval_t: f64,
+    /// Last time plate connectivity was enforced.
+    pub conn_t: f64,
     /// Rifts currently propagating.
     pub rifts: Vec<ActiveRift>,
     /// Detached arc plates: arc plate -> (parent upper plate, lower plate, detachment time).
@@ -435,7 +443,7 @@ impl World {
         let mut w = World {
             hash: SpatialHash::new(1.5 * s), p, t: 0.0, s, n_scale, pair_ncc: HashMap::new(),
             rot: vec![IDENT; n_plates], rot_hist: vec![], parcels, plates, grid, hotspots,
-            polarity: HashMap::new(), pair_absorbed: HashMap::new(), pair_ccf: HashMap::new(), rift_pairs: HashMap::new(), static_myr: HashMap::new(), pair_compress: HashMap::new(), cell_tractions: HashMap::new(), stress_eval_t: -1.0e9, rifts: vec![], arc_plates: HashMap::new(), hot_drift, detail_noise, sea_v0: None, sea_level: 0.0, sediment: 0.0, rng, binfo: vec![], stats: Stats::default(), weak_noise,
+            polarity: HashMap::new(), pair_absorbed: HashMap::new(), pair_ccf: HashMap::new(), rift_pairs: HashMap::new(), static_myr: HashMap::new(), pair_compress: HashMap::new(), cell_tractions: HashMap::new(), stress_eval_t: -1.0e9, conn_t: 0.0, rifts: vec![], arc_plates: HashMap::new(), hot_drift, detail_noise, sea_v0: None, sea_level: 0.0, sediment: 0.0, rng, binfo: vec![], stats: Stats::default(), weak_noise,
         };
         w.rebuild_hash();
         crate::step::plate_stats(&mut w);

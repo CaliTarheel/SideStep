@@ -37,6 +37,9 @@ pub fn step(w: &mut World) {
     backarc(w);
     // 8. Suturing and removal of consumed plates.
     merge_and_cleanup(w);
+    // 8b. A plate is a rigid body: disconnected pieces become their own plates or join their
+    // surroundings (docking, accretion and splits between fragments leave orphans otherwise).
+    if w.t - w.conn_t >= 10.0 { w.conn_t = w.t; enforce_connectivity(w); }
     plate_stats(w);
     w.rebuild_hash();
     w.t += dt;
@@ -684,11 +687,16 @@ fn rifting(w: &mut World) {
         let s2 = w.s * w.s;
         for (i, pc) in w.parcels.iter().enumerate() {
             if !pc.alive || pc.plate != a as u32 || pc.stress <= 0.0 { continue; }
+            let mega = (w.plates[a].n as f64) > w.p.mega_frac * w.stats.n_parcels.max(1) as f64;
             let mut sc = if pc.kind == Kind::Continental {
                 pc.stress as f64 * (1.0 + weakness_at(w, pc.pos))
             } else if pc.amp >= 3.0 {
-                // oceanic lithosphere only fails at a genuine constriction
+                // oceanic lithosphere only fails at a genuine constriction ...
                 pc.stress as f64 / w.p.ocean_strength
+            } else if mega {
+                // ... except on a plate so large that nothing constrains it: broad failure
+                // along the stressed corridor - a ridge jump - at extra strength.
+                pc.stress as f64 / (w.p.ocean_strength * 1.5)
             } else { continue };
             // A fresh boundary nearby is already taking up the extension: no new break here.
             let mut relieved = false;
@@ -1072,6 +1080,94 @@ fn backarc(w: &mut World) {
         w.arc_plates.insert(new_id, (upper, lower, t));
         w.plates[upper as usize].n = upper_n.saturating_sub(set.len());
         w.stats.backarcs += 1;
+    }
+}
+
+/// A plate must be one connected region. Secondary components either become their own plate
+/// (inheriting the motion; young-plate refractories apply) or, if small, are adopted whole by
+/// the neighbouring plate they actually touch.
+fn enforce_connectivity(w: &mut World) {
+    let s = w.s;
+    let t = w.t;
+    let n = w.parcels.len();
+    // Orphans below Greenland size join a neighbour; only genuinely large fragments become plates.
+    let min_n = (150.0 * w.n_scale).round() as usize;
+    let mut comp = vec![u32::MAX; n];
+    let mut comp_plate: Vec<u32> = vec![];
+    let mut comp_members: Vec<Vec<usize>> = vec![];
+    for i in 0..n {
+        if !w.parcels[i].alive || comp[i] != u32::MAX { continue; }
+        let pl = w.parcels[i].plate;
+        let cid = comp_members.len() as u32;
+        comp_plate.push(pl);
+        comp[i] = cid;
+        let mut members = vec![i];
+        let mut stack = vec![i];
+        while let Some(j) = stack.pop() {
+            let pj = w.parcels[j].pos;
+            let mut next = vec![];
+            w.hash.query(pj, 1.5 * s, |k| {
+                let ku = k as usize;
+                let pk = &w.parcels[ku];
+                if pk.alive && pk.plate == pl && comp[ku] == u32::MAX && dist(pk.pos, pj) < 1.5 * s { next.push(ku); }
+            });
+            for k in next {
+                if comp[k] == u32::MAX { comp[k] = cid; members.push(k); stack.push(k); }
+            }
+        }
+        comp_members.push(members);
+    }
+    let mut by_plate: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (cid, &pl) in comp_plate.iter().enumerate() { by_plate.entry(pl).or_default().push(cid as u32); }
+    let mut keys: Vec<u32> = by_plate.keys().copied().collect();
+    keys.sort_unstable();
+    for pl in keys {
+        let mut comps = by_plate[&pl].clone();
+        if comps.len() < 2 { continue; }
+        comps.sort_by_key(|&c| std::cmp::Reverse(comp_members[c as usize].len()));
+        for &c in comps.iter().skip(1) {
+            let members = &comp_members[c as usize];
+            if members.len() >= min_n {
+                // large orphan: its own plate, same motion, standard young-plate refractories
+                let new_id = w.plates.len() as u32;
+                let om = w.plates[pl as usize].omega;
+                let mv = w.plates[pl as usize].mean_v;
+                let mut n_cont = 0;
+                for &i in members {
+                    w.parcels[i].plate = new_id;
+                    if w.parcels[i].kind == Kind::Continental { n_cont += 1; }
+                }
+                // born in the past: an administrative split is old lithosphere - it may weld or rift
+                // again immediately, unlike a rift product.
+                w.plates.push(Plate { omega: om, alive: true, tension: 0.0, n: members.len(), n_cont, n_weak: 0, mean_v: mv, slab: 0.0, suction: 0.0, born: t - 80.0 });
+                let parent_rot = w.rot[pl as usize];
+                w.rot.push(parent_rot);
+                w.plates[pl as usize].n = w.plates[pl as usize].n.saturating_sub(members.len());
+                w.stats.split_off += 1;
+            } else {
+                // enclave: adopted whole by the neighbouring plate it touches most
+                let mut votes: HashMap<u32, usize> = HashMap::new();
+                for &i in members {
+                    let pi = w.parcels[i].pos;
+                    let mut best: Option<(u32, f64)> = None;
+                    w.hash.query(pi, 3.0 * s, |k| {
+                        let pk = &w.parcels[k as usize];
+                        if pk.alive && pk.plate != pl {
+                            let d = dist(pk.pos, pi);
+                            if best.map_or(true, |(_, bd)| d < bd) { best = Some((pk.plate, d)); }
+                        }
+                    });
+                    if let Some((bp, _)) = best { *votes.entry(bp).or_insert(0) += 1; }
+                }
+                let mut vv: Vec<(u32, usize)> = votes.into_iter().collect();
+                vv.sort_by_key(|&(pl2, n2)| (std::cmp::Reverse(n2), pl2));
+                if let Some(&(winner, _)) = vv.first() {
+                    for &i in members { w.parcels[i].plate = winner; }
+                    w.plates[pl as usize].n = w.plates[pl as usize].n.saturating_sub(members.len());
+                    w.stats.enclaves += 1;
+                }
+            }
+        }
     }
 }
 
